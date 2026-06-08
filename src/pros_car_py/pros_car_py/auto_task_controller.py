@@ -15,6 +15,8 @@ import math
 import threading
 import time
 
+from .nav2_utils import get_yaw_from_quaternion
+
 
 class AutoTaskController:
     def __init__(self, car_controller, arm_controller, data_processor, ros_communicator):
@@ -87,7 +89,12 @@ class AutoTaskController:
         self.grasp_height_bias = 0.0    # +往上 / -往下 (m)
         # 抓取前的盲推：depth <40cm 會失效，車常停在手臂搆不到的距離。
         # 進 GRASP 前先盲推前進一小段把熊帶進可及範圍 (0 = 關閉)。
-        self.final_creep_time = 0.6     # 秒 (依抓取結果調：壓過頭→減小、搆不到→加大)
+        # 抓取站距 depth 閉環：先前進到 depth ≤ grasp_standoff(或 depth 進盲區失效)才停，
+        # 把 FINE_ALIGN 那個受雜訊/網路影響而會飄的停車點，收斂到一致的近站距，
+        # 再交給下面的 final_creep_time 盲推最後一段(盲區 depth 照不到，只能盲推)。
+        self.grasp_standoff = 0.35      # 公尺，閉環目標站距(設在盲區邊緣)。0=關閉，退回純盲推
+        self.grasp_creep_timeout = 4.0  # 秒，depth 閉環安全上限
+        self.final_creep_time = 0.8     # 秒，盲區內最後一段盲推 (壓過頭→減小、搆不到→加大)
 
     # ==========================================
     # 對外介面 (給 mode 呼叫)
@@ -318,7 +325,15 @@ class AutoTaskController:
                     state = "GRASP"
 
             elif state == "GRASP":
-                # 抓取前盲推：把熊帶進手臂可及範圍 (depth 此時多半已失效)
+                # 1) depth 閉環收斂站距：消除 FINE_ALIGN 受雜訊/網路影響而飄的停車點，
+                #    不管剛剛停在 0.5 還 0.65，都先開到一致的近站距(或 depth 進盲區)。
+                if self.grasp_standoff > 0:
+                    d = self._creep_to_depth(
+                        self.grasp_standoff, stop_event, timeout=self.grasp_creep_timeout
+                    )
+                    if d is not None:
+                        last_valid_depth = d  # 給投影用最新有效 depth
+                # 2) 盲區內最後一段：depth 照不到，只能固定盲推把熊帶進手臂可及範圍
                 if self.final_creep_time > 0:
                     print(f"[Task1] GRASP 前盲推前進 {self.final_creep_time:.1f}s")
                     self._timed_action("FORWARD_SLOW", self.final_creep_time, stop_event)
@@ -356,6 +371,10 @@ class AutoTaskController:
                     self._timed_action("FORWARD_SLOW", self.release_creep_time, stop_event)
                 car.update_action("STOP")
                 arm.release()
+                # 回正車頭：_creep_to_point 只保證位置，朝向會指著起點(貼牆)方向。
+                # 轉回 start_yaw(=spawn 朝向，面向場內)，讓車停回 home 姿態，
+                # 後續 Task2/3「從起點直行」才走得出去。
+                self._orient_to_yaw(self.start_yaw, stop_event)
                 state = "DONE"
 
             elif state == "DONE":
@@ -486,6 +505,69 @@ class AutoTaskController:
                 action = "CLOCKWISE_ROTATION_SLOW"
             else:
                 action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+            car.update_action(action)
+            time.sleep(0.05)
+        car.update_action("STOP")
+
+    def _creep_to_depth(self, target_depth, stop_event, timeout=4.0):
+        """前進到 YOLO depth ≤ target_depth(或 depth 進盲區失效)才停。
+
+        用 depth 回授把 FINE_ALIGN 那個受雜訊/網路延遲影響、會 run-to-run 飄的停車點，
+        收斂到一致的近站距 → 最後的固定盲推才對得準。depth 在 ~0.4m 以下會失效(-1)，
+        故 target 設在盲區邊緣即可：讀到 ≤target 或連續數幀無有效 depth(=已進盲區/熊掉到
+        畫面下緣) 都視為到位。回傳此段看到的最後有效 depth(給 grasp 投影)，沒看到回 None。"""
+        dp = self.data_processor
+        car = self.car_controller
+        print(f"[Task1] depth 閉環收斂站距 → ≤{target_depth:.2f}m")
+        t0 = time.time()
+        last_d = None
+        misses = 0
+        while not stop_event.is_set() and (time.time() - t0) < timeout:
+            info = dp.get_yolo_target_info()
+            found = info is not None and info[0] == 1.0
+            distance = info[1] if info is not None else 0.0
+            if found and distance > 0.0:
+                misses = 0
+                last_d = distance
+                if distance <= target_depth:
+                    break                       # 到達目標站距
+                car.update_action("FORWARD_SLOW")
+            else:
+                misses += 1
+                if misses >= 3:                 # 連續無有效 depth = 已進盲區近點 → 停
+                    break
+                car.update_action("FORWARD_SLOW")  # 單幀抖動：很近了，續推
+            time.sleep(0.05)
+        car.update_action("STOP")
+        return last_d
+
+    def _orient_to_yaw(self, target_yaw, stop_event, tol=8.0, timeout=12.0):
+        """用 AMCL 回授原地旋轉，把車頭轉到 target_yaw (度, map frame)。
+
+        Task1 收尾用：RELEASE 後車頭指著起點(貼牆)方向，轉回 spawn 朝向(start_yaw)
+        讓車停回 home 姿態，後續任務「從起點直行」才出得去。Task2/3 朝特定方向起步也可重用。
+        err 收斂到 ±180；err>0 需增加 yaw → 逆時針(與 _creep_to_point 角度慣例一致)。
+        timeout 為安全上限，避免 AMCL 抖動時無限轉。"""
+        car = self.car_controller
+        print(f"[Nav] 回正車頭 → yaw={target_yaw:.1f}° tol={tol:.1f}")
+        t0 = time.time()
+        while not stop_event.is_set() and (time.time() - t0) < timeout:
+            try:
+                pose, quat = self.data_processor.get_processed_amcl_pose()
+            except Exception:
+                break
+            if quat is None:
+                break
+            cur = get_yaw_from_quaternion(quat[2], quat[3])
+            err = (target_yaw - cur + 180.0) % 360.0 - 180.0
+            if abs(err) <= tol:
+                break
+            # 兩段速：誤差大用全速快轉(180° 才轉得完)，接近目標換慢轉收尾不過衝
+            ccw = err > 0
+            if abs(err) > 30.0:
+                action = "COUNTERCLOCKWISE_ROTATION" if ccw else "CLOCKWISE_ROTATION"
+            else:
+                action = "COUNTERCLOCKWISE_ROTATION_SLOW" if ccw else "CLOCKWISE_ROTATION_SLOW"
             car.update_action(action)
             time.sleep(0.05)
         car.update_action("STOP")
