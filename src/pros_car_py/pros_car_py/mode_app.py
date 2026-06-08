@@ -6,6 +6,7 @@ from pros_car_py.mode_manager import (
     CraneMode,
     AutoNavMode,
     AutoArmMode,
+    AutoTaskMode,
 )
 
 MODES_REGISTRY = {
@@ -14,17 +15,24 @@ MODES_REGISTRY = {
     "mode_crane": ("Manual Crane Control", CraneMode),
     "mode_auto_nav": ("Auto Navigation", AutoNavMode),
     "mode_auto_arm": ("Automatic Arm Mode", AutoArmMode),
+    "mode_auto_task": ("Auto Task (1/2/3)", AutoTaskMode),
 }
 
 
 class ModeApp:
     def __init__(
-        self, car_controller, arm_controller, custom_control, crane_controller
+        self,
+        car_controller,
+        arm_controller,
+        custom_control,
+        crane_controller,
+        auto_task_controller=None,
     ):
         self.car_controller = car_controller
         self.arm_controller = arm_controller
         self.custom_control = custom_control
         self.crane_controller = crane_controller
+        self.auto_task_controller = auto_task_controller
 
         self.palette = [("reversed", "standout", "")]
         self.loop = urwid.MainLoop(None, palette=self.palette)

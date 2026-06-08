@@ -138,6 +138,90 @@ class ArmController:
         except Exception as e:
             print(f"⚠️ 座標轉換或 TF 失敗: {e}")
     
+    # ==========================================
+    # 3. Auto-task 介面 (給狀態機呼叫，同步阻塞)
+    # ==========================================
+    def _transform_point(self, target_frame, src_frame, x, y, z):
+        """把 src_frame 下的點 (x,y,z) 透過 tf2 轉到 target_frame，回傳 PointStamped。"""
+        pt = PointStamped()
+        pt.header.frame_id = src_frame
+        pt.point.x = float(x)
+        pt.point.y = float(y)
+        pt.point.z = float(z)
+        transform = self.tf_buffer.lookup_transform(
+            target_frame, src_frame, rclpy.time.Time()
+        )
+        return tf2_geometry_msgs.do_transform_point(pt, transform)
+
+    def project_and_grab_from_depth(
+        self,
+        depth=None,
+        mode="fixed",
+        fixed_distance=0.42,
+        bear_height=0.05,
+        reach_bias=0.0,
+        height_bias=0.0,
+    ):
+        """對齊後觸發抓取 (同步，呼叫端的狀態機執行緒會阻塞到抓取結束)。
+
+        手臂沒有左右(yaw)自由度，橫向已由車輪對齊，所以只需決定
+        『前方距離 x』與『高度 z』；橫向 y 固定 0。
+
+        mode:
+          "fixed"    : x 用 fixed_distance (base_footprint 正前方)，最穩、不靠 depth。
+          "tf_depth" : 用最後有效 depth，從 camera_optical_frame (0,0,depth)
+                       經 TF 投影到 base_footprint 取得真實前方距離。
+        bear_height: base_footprint 下的目標中心高度，用來蓋掉 depth 只拍到半身的誤差。
+        reach_bias : 在 arm_ik_base 的 x 上再加的偏移 (m)，正值=夾爪往前伸更多。校正前後誤差用。
+        height_bias: 在 arm_ik_base 的 z 上再加的偏移 (m)，正值=夾爪往上。校正高低誤差用。
+
+        回傳 True 表示抓取序列已執行完畢；TF 失敗回傳 False。
+        """
+        try:
+            if mode == "tf_depth" and depth is not None and depth > 0.0:
+                # 相機光學系正前方 depth 處 → base_footprint，取真實前方距離
+                cam_pt = self._transform_point(
+                    "base_footprint", "camera_optical_frame", 0.0, 0.0, depth
+                )
+                forward_x = cam_pt.point.x
+            else:
+                if mode == "tf_depth":
+                    print("⚠️ tf_depth 模式但無有效 depth，退回 fixed_distance。")
+                forward_x = fixed_distance
+
+            # 在 base_footprint 建點 (前方距離, y=0, 蓋掉的高度) → arm_ik_base
+            target = self._transform_point(
+                self.base_link_name, "base_footprint", forward_x, 0.0, bear_height
+            )
+            # 加上校正偏移 (在 arm_ik_base 座標系)
+            x_target = target.point.x + reach_bias
+            z_target = target.point.z + height_bias
+
+            # 診斷：若目標超出手臂可及範圍，IK 會頂在最大伸展 → 必定搆不到，需把車開更近
+            reach = self.joint_limits[0]["length"] + self.joint_limits[1]["length"]
+            dist = math.sqrt(x_target**2 + z_target**2)
+            reach_note = "  ⚠️超出可及(需更近)" if dist > reach else ""
+            print(
+                f"🎯 抓取目標(arm_ik_base): x={x_target:.3f}, z={z_target:.3f} "
+                f"[mode={mode}, forward={forward_x:.3f}, D={dist:.3f}/reach={reach:.3f}]"
+                f"{reach_note}"
+            )
+
+            self._execute_grab_sequence(x_target, z_target)
+            return True
+        except Exception as e:
+            print(f"⚠️ 抓取投影/TF 失敗: {e}")
+            return False
+
+    def release(self):
+        """打開夾爪放下目標 (同步)。"""
+        print("✋ 放下目標：打開夾爪...")
+        self._smooth_move_to(
+            [None, None, self.joint_limits[2]["max_angle"]], step=5.0, delay=0.1
+        )
+        time.sleep(0.5)
+        print("✅ 已放下。")
+
     def _execute_grab_sequence(self, x_target, z_target):
         """背景執行的完整抓取流程 (結合軌跡規劃)"""
         

@@ -13,6 +13,7 @@ from pros_car_py.nav_processing import Nav2Processing
 from pros_car_py.ros_communicator import RosCommunicator
 from pros_car_py.crane_controller import CraneController
 from pros_car_py.custom_control import CustomControl
+from pros_car_py.auto_task_controller import AutoTaskController
 from pros_car_py.ik_solver import PybulletRobotController
 from pros_car_py.mode_app import ModeApp
 
@@ -36,7 +37,16 @@ def main():
         ros_communicator, data_processor, ik_solver, num_joints=7
     )
     custom_control = CustomControl(car_controller, arm_controller)
-    app = ModeApp(car_controller, arm_controller, custom_control, crane_controller)
+    auto_task_controller = AutoTaskController(
+        car_controller, arm_controller, data_processor, ros_communicator
+    )
+    app = ModeApp(
+        car_controller,
+        arm_controller,
+        custom_control,
+        crane_controller,
+        auto_task_controller,
+    )
 
     try:
         app.main()

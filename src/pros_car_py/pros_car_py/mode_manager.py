@@ -85,3 +85,23 @@ class AutoArmMode(BaseMode):
             message=f"AutoArm Mode: Submode {submode}\nPress 'q' to go back.",
             on_key=on_key,
         )
+
+
+class AutoTaskMode(BaseMode):
+    submodes = ["task1", "task2", "task3"]
+
+    def enter(self):
+        self.app.horizontal_select(self.submodes, self.handle_submode_select)
+
+    def handle_submode_select(self, submode):
+        def on_key(key):
+            self.app.auto_task_controller.run(submode, key)
+
+        self.show_submode_screen(
+            message=(
+                f"Auto Task Mode: {submode}\n"
+                f"Press 's' to start, 'i' to reset initialpose (after respawn), "
+                f"'q' to abort / go back."
+            ),
+            on_key=on_key,
+        )

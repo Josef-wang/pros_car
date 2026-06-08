@@ -110,6 +110,11 @@ class RosCommunicator(Node):
         # publish goal_pose
         self.publisher_goal_pose = self.create_publisher(PoseStamped, "/goal_pose", 10)
 
+        # publish initialpose (重新 anchor AMCL 到起點，car respawn 後用)
+        self.publisher_initialpose = self.create_publisher(
+            PoseWithCovarianceStamped, "/initialpose", 10
+        )
+
         # publish robot arm angle
         self.publisher_joint_trajectory = self.create_publisher(
             JointTrajectoryPoint, DeviceDataTypeEnum.robot_arm, 10
@@ -120,6 +125,12 @@ class RosCommunicator(Node):
         )
 
         self.publisher_target_label = self.create_publisher(String, "/target_label", 10)
+
+        # 告訴 YOLO node 目前 auto-task 要追哪個 class (bear / knob ...)。
+        # 空字串代表不過濾。YOLO 端訂閱 /yolo/target_class 動態切換，不用重啟。
+        self.publisher_yolo_target_class = self.create_publisher(
+            String, "/yolo/target_class", 10
+        )
 
         self.crane_state_publisher = self.create_publisher(String, "crane_state", 10)
 
@@ -337,6 +348,29 @@ class RosCommunicator(Node):
         goal_pose.pose.orientation.w = 1.0
         self.publisher_goal_pose.publish(goal_pose)
 
+    def publish_initial_pose(self, x=0.0, y=0.0, yaw=0.0):
+        """重新 anchor AMCL 到指定 map 座標 (預設起點 0,0,0)。
+        car respawn 後 AMCL 定位會錯，發這個即可重置，不必重開 localization。"""
+        import math
+
+        msg = PoseWithCovarianceStamped()
+        msg.header = Header()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "map"
+        msg.pose.pose.position.x = float(x)
+        msg.pose.pose.position.y = float(y)
+        msg.pose.pose.position.z = 0.0
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        # 給一點初始不確定度，幫助 AMCL 收斂 (x,y ~0.25m, yaw ~0.07rad)
+        cov = [0.0] * 36
+        cov[0] = 0.25 * 0.25
+        cov[7] = 0.25 * 0.25
+        cov[35] = 0.0685
+        msg.pose.covariance = cov
+        self.publisher_initialpose.publish(msg)
+        self.get_logger().info(f"已發布 /initialpose 重定位於 ({x}, {y}, yaw={yaw}).")
+
     # publish robot arm angle
     def publish_robot_arm_angle(self, angle):
         joint_trajectory_point = JointTrajectoryPoint()
@@ -401,6 +435,12 @@ class RosCommunicator(Node):
         target_label_msg = String()
         target_label_msg.data = label
         self.publisher_target_label.publish(target_label_msg)
+
+    def publish_yolo_target_class(self, class_name):
+        """設定 YOLO node 要追蹤的目標 class；傳 "" 代表不過濾。"""
+        msg = String()
+        msg.data = class_name if class_name else ""
+        self.publisher_yolo_target_class.publish(msg)
 
     # 天車
     def publish_crane_state(self, state):
