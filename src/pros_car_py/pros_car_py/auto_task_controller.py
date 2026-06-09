@@ -96,6 +96,40 @@ class AutoTaskController:
         self.grasp_creep_timeout = 4.0  # 秒，depth 閉環安全上限
         self.final_creep_time = 0.8     # 秒，盲區內最後一段盲推 (壓過頭→減小、搆不到→加大)
 
+        # ---- Task 3 (開門) ----
+        # 起步路標：朝門邊兩熊前進把門帶進視野。門邊熊在遠處(>YOLO max_target_distance)，
+        # 必須用 "bear:far" 後綴讓 YOLO 反過來挑「最遠」熊、並關掉距離閘門，
+        # 否則近模式會把遠熊濾光 → 車找不到目標、不會往門開過去。
+        self.landmark_class = "bear:far"
+        self.task3_target_class = "knob"    # 門把 class (detection.pt 內建)
+        # 實測：knob 要靠到「離遠方兩熊約 1m」才穩定偵測得到。故切換點設 1.0m：
+        # 熊靠到 1m 就切 knob，此時 knob 已可見、且熊還穩穩在畫面裡(未到跟丟距離)，
+        # SEARCH 一轉就咬到 knob。切太近(舊 0.6)熊會先掉出畫面、knob 也早就該切了。
+        self.landmark_stop_distance = 1.0   # 公尺：路標熊靠到這麼近就切 knob (=knob 可偵測距離)
+        # 場上有別的近熊(Task1 熊等)當雜訊。門邊兩熊在場地另一頭、起點時很遠。
+        # 未鎖定前，距離 < 此門檻的熊一律當雜訊(旋轉略過)，只 commit「夠遠」的門邊熊。
+        # 實測雜熊出現在 ~1m；門邊熊起點時更遠 → 設 1.5m 區隔。太小會誤鎖近熊；
+        # 太大若門邊熊起點沒那麼遠會永遠 commit 不到(只能靠 timeout fallback)。
+        self.landmark_min_distance = 1.5    # 公尺：低於此距離的熊視為近雜熊、不當門路標
+        # commit 後排除近熊雜訊：近熊出現在畫面『極左/右邊緣』(實測 dx≈-290)，而門邊熊
+        # 會被我們轉到中央。故 |dx| 超過此門檻的偵測視為邊緣雜訊/即將出框 → 不追、不據以
+        # 切換，只維持直行。比『距離連續性』穩(不會被閃爍離群值錨死)。
+        self.landmark_edge_px = 230         # px：|dx| 超過此值的偵測當邊緣雜訊忽略
+        # 置中後鎖航向沿正前方直行的設定(不依賴連續追熊，靠 AMCL 閉環)。
+        self.landmark_drive_timeout = 15.0  # 秒：鎖航向直行的安全上限
+        self.landmark_blind_time = 4.0      # 秒：拿不到 AMCL 時改盲推前進的秒數
+        # 到門前找 knob：knob 在兩熊中間，到位時常偏一邊或還差一點距離。
+        # SEARCH 改左右擴張擺掃，且每次反向往前挪一點(近一點更好認)，累計設上限免撞門。
+        self.knob_search_creep = 0.3        # 秒：SEARCH 每次反向往前挪的盲推秒數
+        self.knob_search_max_creep = 2.0    # 秒：SEARCH 累計前挪上限
+        # timeout 純安全網：連續慢速接近(從 ~4m 邊轉邊前進)要夠長，別在還沒到門前就誤切。
+        self.landmark_timeout = 35.0        # 秒：朝路標前進的安全上限，逾時才 fallback 切 knob
+        self.knob_standoff = 0.35           # 公尺：下壓前 depth 閉環收斂的壓門站距
+        self.knob_height = 0.15             # 公尺：門把高度 (base_footprint)，比地上熊高，待實測微調
+        self.knob_press_depth = 0.03        # 公尺：壓在門把下方多少 (讓夾爪確實壓下去)
+        self.door_close_gripper = True      # True=閉合夾爪當壓桿；False=張開卡住把手 (待實測)
+        self.door_push_time = 2.5           # 秒：壓住後前推開門的時間 (Unlock+Clear)
+
     # ==========================================
     # 對外介面 (給 mode 呼叫)
     # ==========================================
@@ -125,7 +159,7 @@ class AutoTaskController:
         loop_fn = {
             "task1": self._task1_loop,
             # "task2": self._task2_loop,  # ⏳ 待實作
-            # "task3": self._task3_loop,  # ⏳ 待實作
+            "task3": self._task3_loop,
         }.get(task_name)
         if loop_fn is None:
             print(f"⚠️ {task_name} 尚未實作。")
@@ -398,6 +432,211 @@ class AutoTaskController:
         print("[Task1] 狀態機結束。")
 
     # ==========================================
+    # Task 3 狀態機 (開門)
+    # ==========================================
+    def _task3_loop(self, stop_event):
+        """門：朝兩熊路標前進 → 找門把(knob) → 對齊 → 觀察 5s →
+        夾爪下壓門把 → 車前推開門。重用 Task1 的對齊/觀察/depth 閉環積木。
+        計分：OBSERVE=Locate&Observe、PRESS+PUSH=Unlock+Clear。不需回起點。"""
+        car = self.car_controller
+        dp = self.data_processor
+        arm = self.arm_controller
+
+        if self.reanchor_on_start:
+            print(f"[Task3] 重發 initialpose 於起點 ({self.start_x}, {self.start_y})")
+            self.ros_communicator.publish_initial_pose(
+                self.start_x, self.start_y, self.start_yaw
+            )
+            time.sleep(0.5)
+
+        state = "APPROACH_LANDMARK"
+        self.ros_communicator.publish_yolo_target_class(self.landmark_class)
+        print("[Task3] 狀態機啟動 → APPROACH_LANDMARK (朝兩熊前進)")
+        landmark_t0 = time.time()
+        observe_start = None
+        dbg_last = 0.0  # 診斷節流
+        landmark_committed = False  # 是否已鎖定門邊遠熊(排除近雜熊後才 True)
+        landmark_dist = None        # 信任的門邊熊距離(持續更新，平滑跟到 ~1m)
+        last_seen_dx = 0.0          # 門邊熊最後已知橫向位置(跟丟時朝此方向續走)
+        # SEARCH 擺掃狀態(找 knob 用)
+        search_dir = None
+        search_until = None
+        search_dur = self.search_base_sweep
+        knob_creep_used = 0.0       # SEARCH 階段累計前挪秒數
+
+        while not stop_event.is_set():
+            now = time.time()
+            info = dp.get_yolo_target_info()
+            found = info is not None and info[0] == 1.0
+            distance = info[1] if info is not None else 0.0
+            delta_x = info[2] if info is not None else 0.0
+            prev_state = state
+
+            # 診斷：每 ~1s 印一次目前 state + YOLO 回報，方便看「卡在哪、看到什麼」
+            if now - dbg_last >= 1.0:
+                dbg_last = now
+                ld = f"{landmark_dist:.2f}" if landmark_dist is not None else "-"
+                print(
+                    f"[Task3][dbg] state={state} found={int(found)} "
+                    f"dist={distance:.2f} dx={delta_x:.0f} "
+                    f"committed={int(landmark_committed)} ldist={ld}"
+                )
+
+            if state == "APPROACH_LANDMARK":
+                # 朝門邊『遠處兩熊』當路標把門帶進視野，全程連續追蹤+持續置中(每幀修正航向，
+                # 不再一次置中後盲開→不會飄到熊側邊)。容忍 bbox 閃爍：
+                #   - 近雜熊靠 YOLO node 的 far-lock + 邊緣濾除(|dx|>edge)雙重擋掉，不誤判成目標。
+                #   - 短暫跟丟(found=0)不退狀態，朝『最後已知方向』續走咬回來(類 Task1 lost_grace)。
+                # 持續更新 landmark_dist(信任值平滑跟到 ~1m)；到 ~1m 且置中 → 切 knob 交棒。
+                far_enough = found and distance >= self.landmark_min_distance
+                on_edge = found and abs(delta_x) > self.landmark_edge_px
+                good = found and distance > 0.0 and not on_edge  # 信任的門邊熊幀
+                timed_out = (now - landmark_t0) >= self.landmark_timeout
+
+                if not landmark_committed:
+                    if far_enough:
+                        landmark_committed = True
+                        landmark_dist = distance
+                        last_seen_dx = delta_x
+                        print(f"[Task3] 鎖定門邊遠熊 (dist={distance:.2f}m) → 連續追蹤接近")
+                    elif not timed_out:
+                        car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW")  # 旋轉掃描找門邊熊
+                else:
+                    if good:
+                        landmark_dist = distance     # 持續更新信任值(平滑跟到 ~1m，不凍結)
+                        last_seen_dx = delta_x
+                    reached = (
+                        good and 0.0 < distance <= self.landmark_stop_distance
+                        and abs(delta_x) <= self.align_coarse
+                    )
+                    if reached or timed_out:
+                        if timed_out:
+                            print("[Task3] APPROACH_LANDMARK 逾時 → 切 knob")
+                        else:
+                            print(f"[Task3] 到門前 (dist={distance:.2f}m,置中) → 切 knob")
+                        car.update_action("STOP")
+                        self.ros_communicator.publish_yolo_target_class(self.task3_target_class)
+                        time.sleep(0.5)  # 等 YOLO 刷新成 knob，避免讀到殘留熊讀數
+                        state = "SEARCH"
+                    elif good and delta_x > self.align_coarse:
+                        car.update_action("CLOCKWISE_ROTATION_SLOW")        # 偏右 → 右轉置中
+                    elif good and delta_x < -self.align_coarse:
+                        car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW") # 偏左 → 左轉置中
+                    elif good:
+                        car.update_action("FORWARD_SLOW")                   # 已置中 → 前進接近
+                    else:
+                        # 跟丟/邊緣雜訊幀：不退狀態，朝最後已知方向續走咬回來
+                        if abs(last_seen_dx) > self.align_coarse:
+                            car.update_action(
+                                "CLOCKWISE_ROTATION_SLOW" if last_seen_dx > 0
+                                else "COUNTERCLOCKWISE_ROTATION_SLOW"
+                            )
+                        else:
+                            car.update_action("FORWARD_SLOW")               # 上次已對正 → 續直行
+
+            elif state == "SEARCH":
+                if found:
+                    car.update_action("STOP")
+                    search_dir = None  # 重置擺掃狀態
+                    state = "APPROACH"
+                else:
+                    # 左右擴張擺掃找 knob；每次反向往前挪一點(累計上限內)讓 knob 更近更好認
+                    if search_dir is None:
+                        search_dir = "CCW"
+                        search_dur = self.search_base_sweep
+                        search_until = now + search_dur
+                    elif now >= search_until:
+                        search_dir = "CW" if search_dir == "CCW" else "CCW"
+                        search_dur += self.search_sweep_increment
+                        search_until = now + search_dur
+                        if knob_creep_used < self.knob_search_max_creep:
+                            self._timed_action("FORWARD_SLOW", self.knob_search_creep, stop_event)
+                            knob_creep_used += self.knob_search_creep
+                            print(f"[Task3] SEARCH 找不到 knob，前挪 {self.knob_search_creep:.1f}s "
+                                  f"(累計 {knob_creep_used:.1f}s)")
+                    rot = (
+                        "COUNTERCLOCKWISE_ROTATION_SLOW" if search_dir == "CCW"
+                        else "CLOCKWISE_ROTATION_SLOW"
+                    )
+                    car.update_action(rot)
+
+            elif state == "APPROACH":
+                if not found:
+                    state = "SEARCH"
+                elif delta_x > self.align_coarse:
+                    car.update_action("CLOCKWISE_ROTATION_SLOW")
+                elif delta_x < -self.align_coarse:
+                    car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW")
+                elif distance < 0.0 or (0.0 < distance <= self.stop_distance):
+                    car.update_action("STOP")
+                    state = "FINE_ALIGN"
+                else:
+                    car.update_action("FORWARD_SLOW")
+
+            elif state == "FINE_ALIGN":
+                if not found:
+                    state = "APPROACH"
+                elif delta_x > self.align_fine:
+                    car.update_action("CLOCKWISE_ROTATION_SLOW")
+                elif delta_x < -self.align_fine:
+                    car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW")
+                else:
+                    car.update_action("STOP")
+                    observe_start = now
+                    state = "OBSERVE"
+
+            elif state == "OBSERVE":
+                car.update_action("STOP")
+                if observe_start is None:
+                    observe_start = now
+                elif now - observe_start >= self.observe_seconds:
+                    print("[Task3] 觀察滿 5 秒 ✅ → PRESS")
+                    state = "PRESS"
+
+            elif state == "PRESS":
+                # depth 閉環收斂到一致壓門站距，再下壓門把 (同 Task1 抓取，消停車變異)
+                if self.knob_standoff > 0:
+                    self._creep_to_depth(
+                        self.knob_standoff, stop_event, timeout=self.grasp_creep_timeout
+                    )
+                car.update_action("STOP")
+                ok = arm.open_door_press(
+                    mode="fixed",
+                    fixed_distance=self.fixed_distance,
+                    knob_height=self.knob_height,
+                    press_depth=self.knob_press_depth,
+                    close_gripper=self.door_close_gripper,
+                )
+                if not ok:
+                    print(
+                        "[Task3] ⚠️ 門把下壓失敗 (TF/投影)。"
+                        "請確認 robot_state_publisher 有在跑。中止。"
+                    )
+                    break
+                state = "PUSH"
+
+            elif state == "PUSH":
+                # 維持下壓，車前推把門推開 (Unlock + Clear)
+                print(f"[Task3] 前推開門 {self.door_push_time:.1f}s")
+                self._timed_action("FORWARD_SLOW", self.door_push_time, stop_event)
+                car.update_action("STOP")
+                state = "DONE"
+
+            elif state == "DONE":
+                car.update_action("STOP")
+                arm.reset_arm()
+                print("[Task3] ✅ 完成。")
+                break
+
+            if state != prev_state:
+                print(f"[Task3] {prev_state} → {state}")
+
+            time.sleep(0.1)
+
+        car.update_action("STOP")
+        print("[Task3] 狀態機結束。")
+
+    # ==========================================
     # 共用子程序
     # ==========================================
     def _pick_open_direction(self):
@@ -508,6 +747,29 @@ class AutoTaskController:
             car.update_action(action)
             time.sleep(0.05)
         car.update_action("STOP")
+
+    def _drive_straight_ahead(self, bear_dist, stop_event):
+        """置中門邊熊後，鎖航向沿『目前車頭正前方』直行到離熊約 landmark_stop_distance 處。
+
+        Task3 專用：門邊熊 2m 外偵測不穩、會跟丟，不能全程視覺追蹤。置中時(熊還穩定可見)
+        讀 AMCL 位姿，算出正前方 d = bear_dist - landmark_stop_distance 公尺的目標點，
+        交給 _creep_to_point 閉環直行 —— 全程靠 AMCL，不依賴 YOLO，跟丟也照樣開到位。
+        拿不到 AMCL 時退回計時盲推。"""
+        d = max(0.0, bear_dist - self.landmark_stop_distance)
+        try:
+            pose, quat = self.data_processor.get_processed_amcl_pose()
+        except Exception:
+            pose, quat = None, None
+        if pose is None or quat is None:
+            print(f"[Task3] 無 AMCL → 改盲推前進 {self.landmark_blind_time:.1f}s")
+            self._timed_action("FORWARD_SLOW", self.landmark_blind_time, stop_event)
+            return
+        yaw = math.radians(get_yaw_from_quaternion(quat[2], quat[3]))
+        target = [pose[0] + d * math.cos(yaw), pose[1] + d * math.sin(yaw)]
+        print(f"[Task3] 沿航向直行 {d:.2f}m → ({target[0]:.2f}, {target[1]:.2f})")
+        self._creep_to_point(
+            target, stop_event, tol=0.15, timeout=self.landmark_drive_timeout
+        )
 
     def _creep_to_depth(self, target_depth, stop_event, timeout=4.0):
         """前進到 YOLO depth ≤ target_depth(或 depth 進盲區失效)才停。

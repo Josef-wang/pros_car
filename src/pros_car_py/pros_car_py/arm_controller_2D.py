@@ -222,6 +222,80 @@ class ArmController:
         time.sleep(0.5)
         print("✅ 已放下。")
 
+    def open_door_press(
+        self,
+        depth=None,
+        mode="fixed",
+        fixed_distance=0.42,
+        knob_height=0.15,
+        press_depth=0.03,
+        reach_bias=0.0,
+        height_bias=0.0,
+        close_gripper=True,
+    ):
+        """門把下壓 (Task 3)：把夾爪移到門把處並下壓 press_depth，保持不退回，
+        之後由車輪前進把門推開。投影與抓取相同 (橫向已由車輪對齊，只決定前方距離與高度)，
+        差別在目標高度是門把 (knob_height) 而非地面，且壓在把手下方、結束不退回手臂。
+
+        close_gripper: True=閉合夾爪當壓桿往下壓；False=張開卡住把手。實測再定。
+        回傳 True 表示已壓住；TF 失敗回傳 False。"""
+        try:
+            if mode == "tf_depth" and depth is not None and depth > 0.0:
+                cam_pt = self._transform_point(
+                    "base_footprint", "camera_optical_frame", 0.0, 0.0, depth
+                )
+                forward_x = cam_pt.point.x
+            else:
+                if mode == "tf_depth":
+                    print("⚠️ tf_depth 模式但無有效 depth，退回 fixed_distance。")
+                forward_x = fixed_distance
+
+            target = self._transform_point(
+                self.base_link_name, "base_footprint", forward_x, 0.0, knob_height
+            )
+            x_target = target.point.x + reach_bias
+            z_target = target.point.z + height_bias - press_depth  # 壓在把手下方
+
+            reach = self.joint_limits[0]["length"] + self.joint_limits[1]["length"]
+            dist = math.sqrt(x_target**2 + z_target**2)
+            reach_note = "  ⚠️超出可及(需更近)" if dist > reach else ""
+            print(
+                f"🚪 門把下壓(arm_ik_base): x={x_target:.3f}, z={z_target:.3f} "
+                f"[mode={mode}, forward={forward_x:.3f}, D={dist:.3f}/reach={reach:.3f}]"
+                f"{reach_note}"
+            )
+
+            self._execute_press_sequence(x_target, z_target, close_gripper)
+            return True
+        except Exception as e:
+            print(f"⚠️ 門把下壓投影/TF 失敗: {e}")
+            return False
+
+    def _execute_press_sequence(self, x_target, z_target, close_gripper):
+        """移動夾爪到門把並下壓並保持 (不退回，讓車前推開門)。"""
+        # 步驟 1：夾爪定位 (閉合當壓桿 或 張開卡把手)
+        print("🔧 [1/2] 夾爪定位...")
+        grip = (
+            self.joint_limits[2]["min_angle"]
+            if close_gripper
+            else self.joint_limits[2]["max_angle"]
+        )
+        self._smooth_move_to([None, None, grip], step=5.0, delay=0.1)
+        time.sleep(0.3)
+
+        # 步驟 2：移到門把並下壓，保持姿態 (不退回)
+        print("⬇️ [2/2] 下壓門把並保持...")
+        deg1, deg2 = self._calculate_2d_ik(x_target, z_target)
+        self._smooth_move_to([deg1, deg2, None], step=5.0, delay=0.1)
+        time.sleep(0.5)
+        print("✅ 門把已壓住，準備前推開門。")
+
+    def reset_arm(self):
+        """手臂回初始姿態 (門推開後收手)。"""
+        print("🏠 手臂回初始位置...")
+        self._smooth_move_to([None, self.joint_limits[1]["init"], None], step=5.0, delay=0.1)
+        self._smooth_move_to([self.joint_limits[0]["init"], None, None], step=5.0, delay=0.1)
+
     def _execute_grab_sequence(self, x_target, z_target):
         """背景執行的完整抓取流程 (結合軌跡規劃)"""
         
