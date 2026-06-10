@@ -145,6 +145,12 @@ class AutoTaskController:
         # 前推時手臂在 knob 高度上下來回「掃」，補 FINE_ALIGN 左右微誤差 → 提高壓到把手機率。
         self.door_swing = True              # True=前推時手臂上下擺動；False=固定壓住
         self.door_swing_amp = 0.06          # 公尺：從壓下 z 往上掃的幅度 (掃不到→加大、頂到門→減小)
+        # (b) 推完驗證有沒有全開。實測：開門時車幾乎不前進 → 前向深度『看穿』為主判據
+        #     (開=前向~4m、關=一片~0.4m 近牆)，位移只當深度全失效時的 fallback。沒開→補推一次。
+        self.door_verify = True             # True=推完判斷開門並在沒開時補推
+        self.door_repush_once = True        # True=判定沒全開時補推一次 (門已解鎖)
+        self.door_open_depth = 1.0          # 公尺：前向過半 sample ≥ 此值=看穿=已開 (主判據)
+        self.door_clear_dist = 0.5          # 公尺：fallback——深度全失效時改看 AMCL 前推位移
         # 門推開後先全速後退脫離門口，再接導航回原點 (免卡在門上/與門框糾纏)。
         self.door_back_time = 4.0           # 秒：開門後全速後退的時間
         # 開門完成後回起點 (需 localization_unity/AMCL + Nav2)。重用 Task1 回程積木，終點=起點(0,0)。
@@ -644,25 +650,20 @@ class AutoTaskController:
             elif state == "PUSH":
                 # 手臂維持下壓(不收回)，直接全速 FORWARD(=手動 w 的力道)一路前推開門。
                 # door_swing：前推同時讓手臂在 knob 高度上下來回掃，補 FINE_ALIGN 左右微誤差。
+                push_start = self._current_xy()     # 記推前位置，驗證用
                 print(f"[Task3] 壓住全速前推開門 {self.door_push_time:.1f}s"
                       + ("，手臂上下擺動" if self.door_swing else ""))
-                swing_stop = None
-                swing_thr = None
-                if self.door_swing and self.door_swing_amp > 0:
-                    swing_stop = threading.Event()
-                    swing_thr = threading.Thread(
-                        target=self._arm_swing_loop,
-                        args=(self.knob_arm_forward, self.knob_press_z,
-                              self.knob_press_z + self.door_swing_amp, swing_stop),
-                        daemon=True,
-                    )
-                    swing_thr.start()
-                self._timed_action("FORWARD", self.door_push_time, stop_event)
-                car.update_action("STOP")
-                if swing_stop is not None:
-                    swing_stop.set()
-                    swing_thr.join(timeout=2.0)
+                self._push_with_swing(self.door_push_time, stop_event, self.door_swing)
                 arm.reset_arm()                 # 開完才收手，免拖門/擋回程
+                # (b) 驗證有沒有全開：位移為主、深度為輔。沒開→補推一次(門已解鎖，不再擺動)
+                if self.door_verify:
+                    opened = self._verify_door_open(push_start)
+                    if not opened and self.door_repush_once:
+                        print("[Task3] 判定門沒全開 → 補推一次")
+                        repush_start = self._current_xy()
+                        self._push_with_swing(self.door_push_time, stop_event, False)
+                        arm.reset_arm()
+                        self._verify_door_open(repush_start)
                 # 全速後退脫離門口，再接導航回原點
                 if self.door_back_time > 0:
                     print(f"[Task3] 全速後退脫離門口 {self.door_back_time:.1f}s")
@@ -919,6 +920,64 @@ class AutoTaskController:
         while not swing_stop.is_set():
             arm.arm_to_xz(x, zs[i % 2], label="擺動")
             i += 1
+
+    def _push_with_swing(self, duration, stop_event, swing):
+        """全速 FORWARD 前推 duration 秒；swing=True 時前推同時開背景手臂擺動。
+        PUSH 主推 + 補推共用，避免重複。"""
+        car = self.car_controller
+        swing_stop = None
+        swing_thr = None
+        if swing and self.door_swing_amp > 0:
+            swing_stop = threading.Event()
+            swing_thr = threading.Thread(
+                target=self._arm_swing_loop,
+                args=(self.knob_arm_forward, self.knob_press_z,
+                      self.knob_press_z + self.door_swing_amp, swing_stop),
+                daemon=True,
+            )
+            swing_thr.start()
+        self._timed_action("FORWARD", duration, stop_event)
+        car.update_action("STOP")
+        if swing_stop is not None:
+            swing_stop.set()
+            swing_thr.join(timeout=2.0)
+
+    def _front_depth_open(self):
+        """前向深度是否『看穿』(門開→看到遠方)。回 (is_open|None, 描述)。
+        取 multi_depth 中央前向 [7:13]，過半有效值 ≥ door_open_depth = 看穿=開。
+        全失效時無法判別(可能太近壓在門上、也可能看穿)→ 回 None 交由位移裁決。"""
+        dp = self.data_processor
+        depths = dp.get_camera_x_multi_depth()
+        if not depths or len(depths) < 13:
+            return None, "拿不到 multi_depth"
+        front = depths[7:13]
+        valid = [d for d in front if d is not None and d > 0.0]
+        if not valid:
+            return None, "前向全失效(太近或看穿，無法判別)"
+        far = [d for d in valid if d >= self.door_open_depth]
+        is_open = len(far) >= max(1, (len(valid) + 1) // 2)
+        return is_open, f"前向有效={[round(d, 2) for d in valid]} ≥{self.door_open_depth} 佔 {len(far)}/{len(valid)}"
+
+    def _verify_door_open(self, start_xy):
+        """(b) 判斷門有沒有全開：AMCL 前推位移為主、前向深度為輔。回 True=判定已開。
+        位移 ≥ door_clear_dist = 車推得過去=開；無 AMCL 才退用深度看穿；都拿不到→不補推。"""
+        moved = None
+        cur = self._current_xy()
+        if start_xy is not None and cur is not None:
+            moved = math.hypot(cur[0] - start_xy[0], cur[1] - start_xy[1])
+        depth_open, depth_note = self._front_depth_open()
+        # 實測：開門時車幾乎不前進(門開了車沒穿過去)，位移量不到 → 前向深度『看穿』為主判據；
+        # 深度全失效(太近壓在門上、無法判別)才退用位移；都拿不到才放行不補推。
+        if depth_open is not None:
+            judged = depth_open
+        elif moved is not None:
+            judged = moved >= self.door_clear_dist
+        else:
+            judged = True
+        md = f"{moved:.2f}m" if moved is not None else "無AMCL"
+        print(f"[Task3] 開門檢查：前推位移={md}(門檻{self.door_clear_dist}) / 深度:{depth_note}"
+              f" → {'判定已開 ✅' if judged else '疑似沒全開 ⚠️'}")
+        return judged
 
     def _orient_to_yaw(self, target_yaw, stop_event, tol=8.0, timeout=12.0):
         """用 AMCL 回授原地旋轉，把車頭轉到 target_yaw (度, map frame)。
