@@ -153,6 +153,22 @@ class ArmController:
         )
         return tf2_geometry_msgs.do_transform_point(pt, transform)
 
+    def depth_to_base_forward(self, depth):
+        """把相機光學系正前方 depth 處投影到 base_footprint，回傳前方距離 x (m)；失敗回 None。
+
+        給『深度錨點 + AMCL 追距離』用：抓取時車已進深度盲區量不到，靠盲區前最後有效 depth
+        投影出 base_footprint 下熊的前方距離當錨，呼叫端再扣掉之後的 AMCL 位移得到當下距離。"""
+        if depth is None or depth <= 0.0:
+            return None
+        try:
+            cam_pt = self._transform_point(
+                "base_footprint", "camera_optical_frame", 0.0, 0.0, depth
+            )
+            return cam_pt.point.x
+        except Exception as e:
+            print(f"⚠️ depth_to_base_forward TF 失敗: {e}")
+            return None
+
     def project_and_grab_from_depth(
         self,
         depth=None,
@@ -386,6 +402,13 @@ class ArmController:
         - step: 每次更新的最大度數 (越小越滑順)
         - delay: 每次更新間隔的時間 (越大越慢)
         """
+        # 防呆：先把超出關節極限的 target 夾進範圍。否則 _clamp_and_publish 會把
+        # self.joint_angles 卡在邊界、永遠到不了越界 target → while True 無限迴圈
+        # (曾因 IK 對陡峭姿算出 Shoulder=362° 而整個狀態機卡死)。
+        for i in range(len(self.joint_angles)):
+            if target_angles[i] is not None:
+                lo, hi = self.joint_limits[i]["min_angle"], self.joint_limits[i]["max_angle"]
+                target_angles[i] = max(lo, min(hi, target_angles[i]))
         while True:
             all_reached = True
             

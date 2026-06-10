@@ -82,8 +82,13 @@ class AutoTaskController:
 
         # 抓取參數
         self.grasp_mode = "fixed"       # "fixed" 或 "tf_depth"
-        self.fixed_distance = 0.42      # fixed 模式的前方距離 (m)
-        self.bear_height = 0.05         # 目標中心高度 (base_footprint, m)
+        self.fixed_distance = 0.42      # fixed 模式的前方距離 (m)；錨點失敗時的後備常數
+        # (A) 深度錨點 + AMCL 追距離：用盲區前最後有效 depth 投影熊前方距離為錨，盲推後扣 AMCL
+        #     位移得當下距離，動態當 fixed_distance。讓抓取瞄準熊真實位置(不再寫死)。需 AMCL。
+        self.grasp_anchor_track = True  # True=啟用深度錨點追距離；False=用 fixed_distance 常數
+        self.grasp_dist_min = 0.18      # 錨點換算距離夾限下界 (m)
+        self.grasp_dist_max = 0.45      # 錨點換算距離夾限上界 (m)
+        self.bear_height = 0.04         # 目標中心高度 (base_footprint, m)；降低=往地面抓，受 reach 限制
         # 夾爪末端微調 (校正小誤差用，arm_ik_base 座標)
         self.grasp_reach_bias = 0.0     # +往前伸更多 / -往回收 (m)
         self.grasp_height_bias = 0.0    # +往上 / -往下 (m)
@@ -94,7 +99,18 @@ class AutoTaskController:
         # 再交給下面的 final_creep_time 盲推最後一段(盲區 depth 照不到，只能盲推)。
         self.grasp_standoff = 0.35      # 公尺，閉環目標站距(設在盲區邊緣)。0=關閉，退回純盲推
         self.grasp_creep_timeout = 4.0  # 秒，depth 閉環安全上限
-        self.final_creep_time = 0.8     # 秒，盲區內最後一段盲推 (壓過頭→減小、搆不到→加大)
+        self.final_creep_time = 0.3     # 秒，盲區內最後一段盲推 (壓過頭/撞倒熊→減小、搆不到→加大)
+        # 抓完驗證有沒有夾到 + 失敗重抓 (手臂無回授/Unity 不發 joint_states，只能靠視覺)。
+        # 後退查看法：抓完後退一點，前方『又出現熊』=還在地上=沒夾到→重抓；『沒出現』=被夾走=成功。
+        # (熊收在 init 姿時相機看不到，所以夾到後前方會是空的)
+        self.grasp_verify = True        # True=抓完後退查看、失敗自動重抓
+        self.verify_back_time = 1.0     # 秒：後退查看的時間 (要退到熊重回 depth 偵測範圍 >0.4m)
+        self.verify_window = 1.0        # 秒：後退後取樣 YOLO 的時間窗
+        self.verify_need_frames = 3     # 窗內偵測到前方有熊 ≥ 此幀數 = 沒夾到
+        self.verify_bear_max_dist = 0.9 # m：只認此距離內的熊算「還在前方」(濾遠處別隻熊；0=不限)
+        self.regrasp_max_attempts = 3   # 重抓上限，超過放棄
+        self.regrasp_reach_step = 0.015 # m：每次重抓 reach_bias 增量 (+=夾爪往前伸更多，治搆不到)
+        self.regrasp_creep_time = 0.45  # 秒：重抓時的盲推時間 (比第一次 0.3 大=重抓更靠近，治搆不到)
 
         # ---- Task 3 (開門) ----
         # 起步路標：朝門邊兩熊前進把門帶進視野。門邊熊在遠處(>YOLO max_target_distance)，
@@ -231,6 +247,10 @@ class AutoTaskController:
         state = "SEARCH"
         observe_start = None
         last_valid_depth = None
+        # 重抓狀態：本地副本，重抓時遞增，不污染 self.*（跨 run 不殘留）
+        grasp_attempt = 0
+        reach_bias = self.grasp_reach_bias
+        final_creep = self.final_creep_time
         # 目標追蹤記憶 (給掉幀寬限用)
         last_seen_delta_x = 0.0   # 目標最後出現時在左(-)還在右(+)
         lost_start = None         # 掉幀起始時刻；found 時清為 None
@@ -369,8 +389,11 @@ class AutoTaskController:
                     car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW") # 精對齊：左轉
                 else:
                     car.update_action("STOP")
-                    observe_start = time.time()
-                    state = "OBSERVE"
+                    if grasp_attempt > 0:
+                        state = "GRASP"      # 重抓：已重新置中，直接抓，不重做 5 秒觀察
+                    else:
+                        observe_start = time.time()
+                        state = "OBSERVE"
 
             elif state == "OBSERVE":
                 car.update_action("STOP")
@@ -393,17 +416,39 @@ class AutoTaskController:
                     )
                     if d is not None:
                         last_valid_depth = d  # 給投影用最新有效 depth
+                # (A) 深度錨點：creep 停在盲區前，用最後有效 depth 投影熊的 base_footprint 前方
+                #     距離當錨 + 記下此刻車位置；之後扣掉盲推的 AMCL 位移得當下熊前方距離。
+                grasp_mode_use = self.grasp_mode
+                grasp_dist = self.fixed_distance
+                forward_anchor = anchor_xy = None
+                if self.grasp_anchor_track and last_valid_depth is not None:
+                    forward_anchor = arm.depth_to_base_forward(last_valid_depth)
+                    anchor_xy = self._current_xy()
                 # 2) 盲區內最後一段：depth 照不到，只能固定盲推把熊帶進手臂可及範圍
-                if self.final_creep_time > 0:
-                    print(f"[Task1] GRASP 前盲推前進 {self.final_creep_time:.1f}s")
-                    self._timed_action("FORWARD_SLOW", self.final_creep_time, stop_event)
+                if final_creep > 0:
+                    print(f"[Task1] GRASP 前盲推前進 {final_creep:.1f}s")
+                    self._timed_action("FORWARD_SLOW", final_creep, stop_event)
                 car.update_action("STOP")
+                # (A) 用 AMCL 位移把錨定距離換算成「當下」熊前方距離 → 動態 fixed_distance
+                if forward_anchor is not None and anchor_xy is not None:
+                    cur_xy = self._current_xy()
+                    traveled = (
+                        math.hypot(cur_xy[0] - anchor_xy[0], cur_xy[1] - anchor_xy[1])
+                        if cur_xy is not None else 0.0
+                    )
+                    grasp_dist = max(
+                        self.grasp_dist_min,
+                        min(self.grasp_dist_max, forward_anchor - traveled),
+                    )
+                    grasp_mode_use = "fixed"  # 已自算真實距離，用 fixed 直接餵
+                    print(f"[Task1] 深度錨點: forward_anchor={forward_anchor:.3f} − 位移"
+                          f"{traveled:.3f} → fixed_distance={grasp_dist:.3f}")
                 ok = arm.project_and_grab_from_depth(
                     depth=last_valid_depth,
-                    mode=self.grasp_mode,
-                    fixed_distance=self.fixed_distance,
+                    mode=grasp_mode_use,
+                    fixed_distance=grasp_dist,
                     bear_height=self.bear_height,
-                    reach_bias=self.grasp_reach_bias,
+                    reach_bias=reach_bias,
                     height_bias=self.grasp_height_bias,
                 )
                 if not ok:
@@ -413,7 +458,56 @@ class AutoTaskController:
                         "(slam_unity.sh 或 docker-compose_robot_unity.yml)。中止。"
                     )
                     break
-                state = "RETURN" if start_pose is not None else "DONE"
+                if self.grasp_verify:
+                    state = "VERIFY"
+                else:
+                    state = "RETURN" if start_pose is not None else "DONE"
+
+            elif state == "VERIFY":
+                # 後退查看：抓完往後退，看前方熊有沒有又出現(還在地上=沒夾到；不見=被夾走=成功)。
+                # 手臂已收 init(相機看不到收起的熊)，所以前方有熊 = 一定是地上沒夾走的那隻。
+                print(f"[Task1] 後退查看 {self.verify_back_time:.1f}s")
+                self._timed_action("BACKWARD_SLOW", self.verify_back_time, stop_event)
+                car.update_action("STOP")
+                v_t0 = time.time()
+                v_hits = v_samples = 0
+                while (time.time() - v_t0) < self.verify_window and not stop_event.is_set():
+                    vinfo = dp.get_yolo_target_info()
+                    vf = vinfo is not None and vinfo[0] == 1.0
+                    vd = vinfo[1] if vinfo is not None else 0.0
+                    vx = vinfo[2] if vinfo is not None else 0.0
+                    v_samples += 1
+                    in_range = (self.verify_bear_max_dist <= 0.0) or (vd <= 0.0) or (vd <= self.verify_bear_max_dist)
+                    if vf and in_range:
+                        v_hits += 1
+                    print(f"[Task1][verify] 前方 found={int(vf)} dist={vd:.2f} dx={vx:.0f} hits={v_hits}")
+                    time.sleep(0.05)
+                bear_still_there = v_hits >= self.verify_need_frames
+                print(f"[Task1] 後退查看：前方有熊 hits={v_hits}/{self.verify_need_frames} "
+                      f"→ {'沒夾到 ⚠️(熊還在地上)' if bear_still_there else '夾到 ✅(前方已空)'}")
+                if bear_still_there:
+                    state = "REGRASP"
+                else:
+                    state = "RETURN" if start_pose is not None else "DONE"
+
+            elif state == "REGRASP":
+                grasp_attempt += 1
+                if grasp_attempt > self.regrasp_max_attempts:
+                    print(f"[Task1] ⚠️ 重抓 {self.regrasp_max_attempts} 次仍失敗，放棄。")
+                    arm.release()
+                    arm.reset_arm()
+                    car.update_action("STOP")
+                    state = "DONE"
+                else:
+                    # 放掉沒夾好的 → 夾爪再伸一點(治搆不到) + 盲推用較短的重抓值(車已較近) →
+                    # 回 APPROACH 重新接近(已後退，熊在較遠前方，需重新開過去再對齊)
+                    arm.release()
+                    arm.reset_arm()
+                    reach_bias += self.regrasp_reach_step
+                    final_creep = self.regrasp_creep_time
+                    print(f"[Task1] 第 {grasp_attempt}/{self.regrasp_max_attempts} 次重抓："
+                          f"reach_bias→{reach_bias:.3f}m, final_creep→{final_creep:.2f}s → 重新接近")
+                    state = "APPROACH"
 
             elif state == "RETURN":
                 self._return_to_start(start_pose, stop_event)
