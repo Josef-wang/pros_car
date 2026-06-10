@@ -475,6 +475,9 @@ class AutoTaskController:
             )
             time.sleep(0.5)
 
+        # (評估用) 記起點朝向正確時的深度剖面，回程轉正後再印一次對照
+        self._log_depth_profile("起點-reanchor後")
+
         state = "APPROACH_LANDMARK"
         self.ros_communicator.publish_yolo_target_class(self.landmark_class)
         print("[Task3] 狀態機啟動 → APPROACH_LANDMARK (朝兩熊前進)")
@@ -686,9 +689,11 @@ class AutoTaskController:
                         tol=self.release_creep_tol, timeout=self.release_creep_timeout,
                     )
                     car.update_action("STOP")
-                    # 同 Task1：轉回 start_yaw(spawn 朝向)，讓車頭回到起始姿態
-                    self._orient_to_yaw(self.start_yaw, stop_event)
+                    # 同 Task1：轉回 start_yaw(spawn 朝向)，讓車頭回到起始姿態 (強制向右轉)
+                    self._orient_to_yaw(self.start_yaw, stop_event, direction="cw")
                     car.update_action("STOP")
+                    # (評估用) 轉正後印深度剖面，跟起點對照看能否拿來校驗朝向
+                    self._log_depth_profile("回程-轉正後")
                 state = "DONE"
 
             elif state == "DONE":
@@ -942,6 +947,26 @@ class AutoTaskController:
             swing_stop.set()
             swing_thr.join(timeout=2.0)
 
+    def _log_depth_profile(self, label):
+        """只印前向深度剖面(左緣[0:7]/前[7:13]/右緣[13:20] 各自有效平均 + raw)，
+        給『深度驗回程朝向』評估用，純 log 不影響任何控制。"""
+        depths = self.data_processor.get_camera_x_multi_depth()
+        if not depths or len(depths) < 20:
+            print(f"[Task3][depth:{label}] 拿不到 multi_depth")
+            return
+
+        def stat(xs):
+            v = [d for d in xs if d is not None and d > 0.0]
+            return (sum(v) / len(v), len(v), len(xs)) if v else (None, 0, len(xs))
+
+        def fmt(s):
+            avg, nv, n = s
+            return f"{avg:.2f}m({nv}/{n})" if avg is not None else f"全失效(0/{n})"
+
+        left, front, right = stat(depths[0:7]), stat(depths[7:13]), stat(depths[13:20])
+        raw = [round(d, 2) if (d is not None and d > 0) else -1 for d in depths]
+        print(f"[Task3][depth:{label}] 左={fmt(left)} 前={fmt(front)} 右={fmt(right)} | raw={raw}")
+
     def _front_depth_open(self):
         """前向深度是否『看穿』(門開→看到遠方)。回 (is_open|None, 描述)。
         取 multi_depth 中央前向 [7:13]，過半有效值 ≥ door_open_depth = 看穿=開。
@@ -979,15 +1004,17 @@ class AutoTaskController:
               f" → {'判定已開 ✅' if judged else '疑似沒全開 ⚠️'}")
         return judged
 
-    def _orient_to_yaw(self, target_yaw, stop_event, tol=8.0, timeout=12.0):
+    def _orient_to_yaw(self, target_yaw, stop_event, tol=8.0, timeout=12.0, direction=None):
         """用 AMCL 回授原地旋轉，把車頭轉到 target_yaw (度, map frame)。
 
         Task1 收尾用：RELEASE 後車頭指著起點(貼牆)方向，轉回 spawn 朝向(start_yaw)
         讓車停回 home 姿態，後續任務「從起點直行」才出得去。Task2/3 朝特定方向起步也可重用。
         err 收斂到 ±180；err>0 需增加 yaw → 逆時針(與 _creep_to_point 角度慣例一致)。
-        timeout 為安全上限，避免 AMCL 抖動時無限轉。"""
+        timeout 為安全上限，避免 AMCL 抖動時無限轉。
+        direction：None=走最短路徑(預設，Task1 行為不變)；"cw"=強制向右(順時針)、
+        "ccw"=強制向左(逆時針)轉到位 —— 不管哪邊近，照指定方向轉。"""
         car = self.car_controller
-        print(f"[Nav] 回正車頭 → yaw={target_yaw:.1f}° tol={tol:.1f}")
+        print(f"[Nav] 回正車頭 → yaw={target_yaw:.1f}° tol={tol:.1f} dir={direction or '最短'}")
         t0 = time.time()
         while not stop_event.is_set() and (time.time() - t0) < timeout:
             try:
@@ -1000,8 +1027,14 @@ class AutoTaskController:
             err = (target_yaw - cur + 180.0) % 360.0 - 180.0
             if abs(err) <= tol:
                 break
+            # 方向：預設走最短(err>0→逆時針)；指定 direction 則強制該方向轉到位
+            if direction == "cw":
+                ccw = False
+            elif direction == "ccw":
+                ccw = True
+            else:
+                ccw = err > 0
             # 兩段速：誤差大用全速快轉(180° 才轉得完)，接近目標換慢轉收尾不過衝
-            ccw = err > 0
             if abs(err) > 30.0:
                 action = "COUNTERCLOCKWISE_ROTATION" if ccw else "CLOCKWISE_ROTATION"
             else:
