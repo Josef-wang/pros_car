@@ -110,7 +110,7 @@ class AutoTaskController:
         self.verify_bear_max_dist = 0.9 # m：只認此距離內的熊算「還在前方」(濾遠處別隻熊；0=不限)
         self.regrasp_max_attempts = 3   # 重抓上限，超過放棄
         self.regrasp_reach_step = 0.015 # m：每次重抓 reach_bias 增量 (+=夾爪往前伸更多，治搆不到)
-        self.regrasp_creep_time = 0.45  # 秒：重抓時的盲推時間 (比第一次 0.3 大=重抓更靠近，治搆不到)
+        self.regrasp_creep_time = 0.43  # 秒：重抓時的盲推時間 (比第一次 0.3 大=重抓更靠近，治搆不到)
 
         # ---- Task 3 (開門) ----
         # 起步路標：朝門邊兩熊前進把門帶進視野。門邊熊在遠處(>YOLO max_target_distance)，
@@ -140,6 +140,14 @@ class AutoTaskController:
         self.knob_search_max_creep = 2.0    # 秒：SEARCH 累計前挪上限
         # timeout 純安全網：連續慢速接近(從 ~4m 邊轉邊前進)要夠長，別在還沒到門前就誤切。
         self.landmark_timeout = 35.0        # 秒：朝路標前進的安全上限，逾時才 fallback 切 knob
+        # 卡住脫困：起點(Task1 收尾姿態)左前輪常稍微被橋卡住 → 朝熊前推但 YOLO 距離不縮短。
+        # 偵測到「committed 後持續前推但距離沒縮短」就做一段扭動(後退→右轉→前進→左轉)把輪子
+        # 挪開，再切回原本偵測熊模式重新接近。各段全速取得脫困力道，左右轉對稱大致還原航向。
+        self.landmark_stuck_timeout = 2.0   # 秒：committed 後持續前推但距離未縮短超過此時間 = 卡住
+        self.landmark_stuck_eps = 0.05      # 公尺：距離至少縮短此值才算有進展(濾 YOLO 距離抖動)
+        self.escape_back_time = 0.2         # 秒：脫困後退時間
+        self.escape_turn_time = 0.2         # 秒：脫困左/右轉時間 (右轉與左轉共用)
+        self.escape_fwd_time = 0.2          # 秒：脫困前進時間
         self.knob_standoff = 0.35           # 公尺：壓門前 depth 閉環收斂站距
         # (B) depth 停點收穩：要求連續 N 幀 ≤target 才算到位、連續 M 幀無 depth 才算進盲區停，
         #     避免單幀雜訊提早停 → 停點 run-to-run 一致 (Task1 維持預設 1/3 不受影響)。
@@ -586,6 +594,9 @@ class AutoTaskController:
         search_until = None
         search_dur = self.search_base_sweep
         knob_creep_used = 0.0       # SEARCH 階段累計前挪秒數
+        # 卡住脫困偵測：committed 後在 FORWARD 接近分支累計「距離沒縮短」的時間
+        stuck_ref_dist = None       # 此趟前推看到的最小距離(基準)；置中/跟丟時清 None 暫停偵測
+        stuck_ref_t = None          # 基準更新時刻
 
         while not stop_event.is_set():
             now = time.time()
@@ -642,13 +653,26 @@ class AutoTaskController:
                         time.sleep(0.5)  # 等 YOLO 刷新成 knob，避免讀到殘留熊讀數
                         state = "SEARCH"
                     elif good and delta_x > self.align_coarse:
+                        stuck_ref_dist = None  # 轉向置中：暫停卡住偵測(轉的時候距離本就不縮)
                         car.update_action("CLOCKWISE_ROTATION_SLOW")        # 偏右 → 右轉置中
                     elif good and delta_x < -self.align_coarse:
+                        stuck_ref_dist = None
                         car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW") # 偏左 → 左轉置中
                     elif good:
-                        car.update_action("FORWARD_SLOW")                   # 已置中 → 前進接近
+                        # 已置中 → 前進接近；同時偵測「持續前推但距離沒縮短」=卡住(左前輪卡橋)
+                        if stuck_ref_dist is None or distance < stuck_ref_dist - self.landmark_stuck_eps:
+                            stuck_ref_dist = distance   # 首次/有進展：更新基準距離與計時起點
+                            stuck_ref_t = now
+                            car.update_action("FORWARD_SLOW")
+                        elif (now - stuck_ref_t) >= self.landmark_stuck_timeout:
+                            self._escape_obstacle(stop_event)  # 距離卡住沒縮 → 扭動脫困
+                            stuck_ref_dist = None              # 扭完重置，切回偵測模式重新計
+                            stuck_ref_t = None
+                        else:
+                            car.update_action("FORWARD_SLOW")   # 還沒到判定時間，續推
                     else:
                         # 跟丟/邊緣雜訊幀：不退狀態，朝最後已知方向續走咬回來
+                        stuck_ref_dist = None  # 跟丟：無有效距離可比，重置偵測
                         if abs(last_seen_dx) > self.align_coarse:
                             car.update_action(
                                 "CLOCKWISE_ROTATION_SLOW" if last_seen_dx > 0
@@ -829,6 +853,18 @@ class AutoTaskController:
         while time.time() < end and not stop_event.is_set():
             self.car_controller.update_action(action)
             time.sleep(0.05)
+
+    def _escape_obstacle(self, stop_event):
+        """卡住脫困：朝熊前推但距離不縮(如起點左前輪被橋卡)時，做一段小幅扭動把輪子挪開。
+        後退→右轉→前進→左轉(各 escape_*_time 秒)，全速取得脫困力道；左右轉對稱大致還原航向，
+        結束後交回 APPROACH_LANDMARK 重新偵測接近。扭動太猛/跟丟熊→把動作改 _SLOW 或縮短秒數。"""
+        print("[Task3] ⚠️ 朝熊前推但距離沒縮短，疑似卡住 → 避障扭動(後退→右轉→前進→左轉)")
+        self._timed_action("BACKWARD", self.escape_back_time, stop_event)
+        self._timed_action("CLOCKWISE_ROTATION", self.escape_turn_time, stop_event)
+        self._timed_action("FORWARD", self.escape_fwd_time, stop_event)
+        self._timed_action("COUNTERCLOCKWISE_ROTATION", self.escape_turn_time, stop_event)
+        self.car_controller.update_action("STOP")
+        print("[Task3] 避障扭動結束 → 切回偵測熊模式")
 
     def _get_start_pose(self, timeout=5.0):
         """輪詢等待 /amcl_pose（AMCL 要先收到 initial pose + 一次更新才會發）。
