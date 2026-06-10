@@ -296,6 +296,28 @@ class ArmController:
         self._smooth_move_to([None, self.joint_limits[1]["init"], None], step=5.0, delay=0.1)
         self._smooth_move_to([self.joint_limits[0]["init"], None, None], step=5.0, delay=0.1)
 
+    def arm_to_xz(self, x, z, close_gripper=None, label=""):
+        """直接以 arm_ik_base 座標 (x=正前方, z=上) 解 IK 把手臂移到定姿 (不投影、確定性)。
+
+        Task3 開門用『舉高→壓下』兩段定姿：同 x、不同 z，由上往下壓門把。
+        close_gripper: None=不動夾爪；True=閉合當壓桿；False=張開。
+        D>reach 時 _calculate_2d_ik 會 clamp 到最大伸展。"""
+        if close_gripper is not None:
+            grip = (
+                self.joint_limits[2]["min_angle"]
+                if close_gripper
+                else self.joint_limits[2]["max_angle"]
+            )
+            self._smooth_move_to([None, None, grip], step=5.0, delay=0.1)
+            time.sleep(0.2)
+        reach = self.joint_limits[0]["length"] + self.joint_limits[1]["length"]
+        dist = math.sqrt(x**2 + z**2)
+        note = "  ⚠️超出可及" if dist > reach else ""
+        print(f"🦾 {label} arm→(x={x:.3f}, z={z:.3f}) D={dist:.3f}/reach={reach:.3f}{note}")
+        deg1, deg2 = self._calculate_2d_ik(x, z)
+        self._smooth_move_to([deg1, deg2, None], step=5.0, delay=0.1)
+        time.sleep(0.4)
+
     def _execute_grab_sequence(self, x_target, z_target):
         """背景執行的完整抓取流程 (結合軌跡規劃)"""
         

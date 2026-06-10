@@ -124,11 +124,31 @@ class AutoTaskController:
         self.knob_search_max_creep = 2.0    # 秒：SEARCH 累計前挪上限
         # timeout 純安全網：連續慢速接近(從 ~4m 邊轉邊前進)要夠長，別在還沒到門前就誤切。
         self.landmark_timeout = 35.0        # 秒：朝路標前進的安全上限，逾時才 fallback 切 knob
-        self.knob_standoff = 0.35           # 公尺：下壓前 depth 閉環收斂的壓門站距
-        self.knob_height = 0.15             # 公尺：門把高度 (base_footprint)，比地上熊高，待實測微調
-        self.knob_press_depth = 0.03        # 公尺：壓在門把下方多少 (讓夾爪確實壓下去)
-        self.door_close_gripper = True      # True=閉合夾爪當壓桿；False=張開卡住把手 (待實測)
-        self.door_push_time = 2.5           # 秒：壓住後前推開門的時間 (Unlock+Clear)
+        self.knob_standoff = 0.35           # 公尺：壓門前 depth 閉環收斂站距
+        # (B) depth 停點收穩：要求連續 N 幀 ≤target 才算到位、連續 M 幀無 depth 才算進盲區停，
+        #     避免單幀雜訊提早停 → 停點 run-to-run 一致 (Task1 維持預設 1/3 不受影響)。
+        self.knob_depth_confirm = 2         # 幀：連續幾幀 depth≤target 才停
+        self.knob_depth_blind = 5           # 幀：連續幾幀無有效 depth 才判定進盲區停
+        # 開門動作 = 舉高 → 靠到最近 → 壓下 → 前推。手臂用 arm_ik_base 直接定姿(不投影)：
+        #   x=正前方伸出量、z=高度(上正下負)，同 x 不同 z 即「由上往下壓」。reach=0.191m。
+        self.knob_arm_forward = 0.13        # 公尺：夾爪前伸量(arm_ik_base x)。搆不到→加大、頂到門→減小
+        self.knob_raise_z = 0.10            # 公尺：舉高姿態 z (把手上方，貼近時不撞把手)
+        self.knob_press_z = -0.02           # 公尺：壓下姿態 z (把手高度，由上往下壓)
+        # (A) depth <0.4m 失效有盲區 → 舉高後「靠到最近」改用 AMCL 位移推固定距離(不靠計時)，
+        #     消掉馬達 ramp/摩擦/延遲造成的落點變異。看 [creep] live 位移調。
+        self.knob_final_creep_dist = 0.10   # 公尺：舉高後靠到最近的位移量 (搆不到→加大、撞門→減小)
+        # fallback：拿不到 AMCL 時才退回計時盲推 (設 0 則不盲推)。
+        self.knob_final_creep_time = 1.0    # 秒：無 AMCL 時靠到最近的盲推秒數
+        self.door_close_gripper = True      # True=閉合夾爪當壓桿；False=張開 (待實測)
+        # 壓下不收手，直接全速 FORWARD(=手動 w)一路推開。全速約半速兩倍距離 → 時間要短。
+        self.door_push_time = 6.0           # 秒：壓住全速前推開門的時間 (沒全開→加長、撞過頭→縮短)
+        # 前推時手臂在 knob 高度上下來回「掃」，補 FINE_ALIGN 左右微誤差 → 提高壓到把手機率。
+        self.door_swing = True              # True=前推時手臂上下擺動；False=固定壓住
+        self.door_swing_amp = 0.06          # 公尺：從壓下 z 往上掃的幅度 (掃不到→加大、頂到門→減小)
+        # 門推開後先全速後退脫離門口，再接導航回原點 (免卡在門上/與門框糾纏)。
+        self.door_back_time = 4.0           # 秒：開門後全速後退的時間
+        # 開門完成後回起點 (需 localization_unity/AMCL + Nav2)。重用 Task1 回程積木，終點=起點(0,0)。
+        self.task3_return_home = True
 
     # ==========================================
     # 對外介面 (給 mode 呼叫)
@@ -594,37 +614,84 @@ class AutoTaskController:
                     state = "PRESS"
 
             elif state == "PRESS":
-                # depth 閉環收斂到一致壓門站距，再下壓門把 (同 Task1 抓取，消停車變異)
+                # 開門序列：舉高 → 靠到最近 → 壓下 (前推在 PUSH)。
+                # 1) (B) depth 閉環收斂一致站距：連續確認停點，消停車變異
                 if self.knob_standoff > 0:
                     self._creep_to_depth(
-                        self.knob_standoff, stop_event, timeout=self.grasp_creep_timeout
+                        self.knob_standoff, stop_event,
+                        timeout=self.grasp_creep_timeout,
+                        confirm_frames=self.knob_depth_confirm,
+                        blind_frames=self.knob_depth_blind,
                     )
                 car.update_action("STOP")
-                ok = arm.open_door_press(
-                    mode="fixed",
-                    fixed_distance=self.fixed_distance,
-                    knob_height=self.knob_height,
-                    press_depth=self.knob_press_depth,
-                    close_gripper=self.door_close_gripper,
+                # 2) 手伸直舉高 (夾爪閉合當壓桿，舉到把手上方)
+                arm.arm_to_xz(
+                    self.knob_arm_forward, self.knob_raise_z,
+                    close_gripper=self.door_close_gripper, label="舉高",
                 )
-                if not ok:
-                    print(
-                        "[Task3] ⚠️ 門把下壓失敗 (TF/投影)。"
-                        "請確認 robot_state_publisher 有在跑。中止。"
+                # 3) (A) 靠到最近：用 AMCL 位移盲推固定距離 (取代計時、消推進變異)
+                if self.knob_final_creep_dist > 0:
+                    self._creep_forward_dist(
+                        self.knob_final_creep_dist, stop_event,
+                        timeout=self.grasp_creep_timeout,
+                        fallback_time=self.knob_final_creep_time,
                     )
-                    break
+                car.update_action("STOP")
+                # 4) 手臂壓下 (同 x、z 降到把手高度，由上往下壓並保持)
+                arm.arm_to_xz(self.knob_arm_forward, self.knob_press_z, label="壓下")
                 state = "PUSH"
 
             elif state == "PUSH":
-                # 維持下壓，車前推把門推開 (Unlock + Clear)
-                print(f"[Task3] 前推開門 {self.door_push_time:.1f}s")
-                self._timed_action("FORWARD_SLOW", self.door_push_time, stop_event)
+                # 手臂維持下壓(不收回)，直接全速 FORWARD(=手動 w 的力道)一路前推開門。
+                # door_swing：前推同時讓手臂在 knob 高度上下來回掃，補 FINE_ALIGN 左右微誤差。
+                print(f"[Task3] 壓住全速前推開門 {self.door_push_time:.1f}s"
+                      + ("，手臂上下擺動" if self.door_swing else ""))
+                swing_stop = None
+                swing_thr = None
+                if self.door_swing and self.door_swing_amp > 0:
+                    swing_stop = threading.Event()
+                    swing_thr = threading.Thread(
+                        target=self._arm_swing_loop,
+                        args=(self.knob_arm_forward, self.knob_press_z,
+                              self.knob_press_z + self.door_swing_amp, swing_stop),
+                        daemon=True,
+                    )
+                    swing_thr.start()
+                self._timed_action("FORWARD", self.door_push_time, stop_event)
                 car.update_action("STOP")
+                if swing_stop is not None:
+                    swing_stop.set()
+                    swing_thr.join(timeout=2.0)
+                arm.reset_arm()                 # 開完才收手，免拖門/擋回程
+                # 全速後退脫離門口，再接導航回原點
+                if self.door_back_time > 0:
+                    print(f"[Task3] 全速後退脫離門口 {self.door_back_time:.1f}s")
+                    self._timed_action("BACKWARD", self.door_back_time, stop_event)
+                    car.update_action("STOP")
+                state = "RETURN" if self.task3_return_home else "DONE"
+
+            elif state == "RETURN":
+                # 回起點 (門已開，Nav2 可規劃穿門回原點)。需 AMCL，拿不到就略過。
+                if self._current_xy() is None:
+                    print("[Task3] ⚠️ 拿不到 AMCL，略過回起點 (需 localization_unity)。")
+                else:
+                    print(f"[Task3] 回起點 ({self.start_x:.2f}, {self.start_y:.2f})")
+                    self._navigate_to(
+                        [self.start_x, self.start_y], stop_event, overshoot=0.0
+                    )
+                    # Nav2 0.5m 容差 → 閉環補完最後一段回到原點
+                    self._creep_to_point(
+                        [self.start_x, self.start_y], stop_event,
+                        tol=self.release_creep_tol, timeout=self.release_creep_timeout,
+                    )
+                    car.update_action("STOP")
+                    # 同 Task1：轉回 start_yaw(spawn 朝向)，讓車頭回到起始姿態
+                    self._orient_to_yaw(self.start_yaw, stop_event)
+                    car.update_action("STOP")
                 state = "DONE"
 
             elif state == "DONE":
                 car.update_action("STOP")
-                arm.reset_arm()
                 print("[Task3] ✅ 完成。")
                 break
 
@@ -771,19 +838,25 @@ class AutoTaskController:
             target, stop_event, tol=0.15, timeout=self.landmark_drive_timeout
         )
 
-    def _creep_to_depth(self, target_depth, stop_event, timeout=4.0):
+    def _creep_to_depth(self, target_depth, stop_event, timeout=4.0,
+                        confirm_frames=1, blind_frames=3):
         """前進到 YOLO depth ≤ target_depth(或 depth 進盲區失效)才停。
 
         用 depth 回授把 FINE_ALIGN 那個受雜訊/網路延遲影響、會 run-to-run 飄的停車點，
         收斂到一致的近站距 → 最後的固定盲推才對得準。depth 在 ~0.4m 以下會失效(-1)，
         故 target 設在盲區邊緣即可：讀到 ≤target 或連續數幀無有效 depth(=已進盲區/熊掉到
-        畫面下緣) 都視為到位。回傳此段看到的最後有效 depth(給 grasp 投影)，沒看到回 None。"""
+        畫面下緣) 都視為到位。回傳此段看到的最後有效 depth(給 grasp 投影)，沒看到回 None。
+
+        (B) confirm_frames/blind_frames：要求『連續』N 幀 ≤target 才停、『連續』M 幀無
+        depth 才判進盲區 → 單幀雜訊不會提早停，停點 run-to-run 更一致。預設 1/3 = 原行為
+        (Task1 不受影響)；Task3 用較嚴的值收穩停點。"""
         dp = self.data_processor
         car = self.car_controller
-        print(f"[Task1] depth 閉環收斂站距 → ≤{target_depth:.2f}m")
+        print(f"[Task1] depth 閉環收斂站距 → ≤{target_depth:.2f}m (confirm={confirm_frames}, blind={blind_frames})")
         t0 = time.time()
         last_d = None
         misses = 0
+        hits = 0
         while not stop_event.is_set() and (time.time() - t0) < timeout:
             info = dp.get_yolo_target_info()
             found = info is not None and info[0] == 1.0
@@ -792,16 +865,60 @@ class AutoTaskController:
                 misses = 0
                 last_d = distance
                 if distance <= target_depth:
-                    break                       # 到達目標站距
-                car.update_action("FORWARD_SLOW")
+                    hits += 1
+                    if hits >= confirm_frames:
+                        break                   # 連續確認到達目標站距
+                    car.update_action("FORWARD_SLOW")
+                else:
+                    hits = 0
+                    car.update_action("FORWARD_SLOW")
             else:
+                hits = 0
                 misses += 1
-                if misses >= 3:                 # 連續無有效 depth = 已進盲區近點 → 停
+                if misses >= blind_frames:       # 連續無有效 depth = 已進盲區近點 → 停
                     break
                 car.update_action("FORWARD_SLOW")  # 單幀抖動：很近了，續推
             time.sleep(0.05)
         car.update_action("STOP")
         return last_d
+
+    def _creep_forward_dist(self, dist, stop_event, timeout=6.0, fallback_time=1.0):
+        """(A) 用 AMCL 位移盲推固定『距離』前進，取代固定『時間』——
+        消掉馬達 ramp/摩擦/指令延遲造成的落點變異。記下起點 xy，FORWARD_SLOW 推到
+        位移 ≥ dist 才停。拿不到 AMCL → fallback 計時盲推 fallback_time 秒。全程印 live 位移。"""
+        car = self.car_controller
+        start = self._current_xy()
+        if start is None:
+            print(f"[Task3] 無 AMCL → 計時盲推 {fallback_time:.1f}s")
+            self._timed_action("FORWARD_SLOW", fallback_time, stop_event)
+            return
+        print(f"[Task3] AMCL 位移盲推 → {dist:.3f}m")
+        t0 = time.time()
+        last_print = 0.0
+        while not stop_event.is_set() and (time.time() - t0) < timeout:
+            cur = self._current_xy()
+            now = time.time()
+            if cur is not None:
+                moved = math.hypot(cur[0] - start[0], cur[1] - start[1])
+                if now - last_print >= 0.3:
+                    print(f"[Task3][creep] 已前進={moved:.3f}m / {dist:.3f}m")
+                    last_print = now
+                if moved >= dist:
+                    break
+            car.update_action("FORWARD_SLOW")
+            time.sleep(0.05)
+        car.update_action("STOP")
+
+    def _arm_swing_loop(self, x, z_lo, z_hi, swing_stop):
+        """背景擺動：手臂在 z_lo(壓下)↔z_hi(略抬) 間反覆，前推時用一段 z 範圍刮過把手，
+        補 FINE_ALIGN 的微小誤差。只動 shoulder/elbow(不碰夾爪)；由 PUSH 開執行緒呼叫，
+        swing_stop.set() 後自然收尾(主執行緒 join 完才 reset_arm，無競爭)。"""
+        arm = self.arm_controller
+        zs = [z_lo, z_hi]
+        i = 0
+        while not swing_stop.is_set():
+            arm.arm_to_xz(x, zs[i % 2], label="擺動")
+            i += 1
 
     def _orient_to_yaw(self, target_yaw, stop_event, tol=8.0, timeout=12.0):
         """用 AMCL 回授原地旋轉，把車頭轉到 target_yaw (度, map frame)。
