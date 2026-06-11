@@ -86,6 +86,12 @@ class RosCommunicator(Node):
             Float32MultiArray, "/yolo/target_info", self.yolo_target_info_callback, 1
         )
 
+        # Task2 上下橋：橋面 seg 訊號 [found, dx, dx_near, dx_far, area, near_cover, top_ratio]
+        self.latest_yolo_bridge_info = None
+        self.yolo_bridge_info_sub = self.create_subscription(
+            Float32MultiArray, "/yolo/bridge_info", self.yolo_bridge_info_callback, 1
+        )
+
         self.latest_camera_x_multi_depth = None
         self.camera_x_multi_depth_sub = self.create_subscription(
             Float32MultiArray,
@@ -403,6 +409,14 @@ class RosCommunicator(Node):
         if self.latest_yolo_target_info is None:
             return None
         return self.latest_yolo_target_info
+
+    def yolo_bridge_info_callback(self, msg):
+        self.latest_yolo_bridge_info = msg
+
+    def get_latest_yolo_bridge_info(self):
+        if self.latest_yolo_bridge_info is None:
+            return None
+        return self.latest_yolo_bridge_info
 
     def camera_x_multi_depth_callback(self, msg):
         self.latest_camera_x_multi_depth = msg

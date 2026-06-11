@@ -28,6 +28,12 @@ class DataProcessor:
         else:
             return None
 
+    def get_yolo_bridge_info(self):
+        if self.ros_communicator.get_latest_yolo_bridge_info() is not None:
+            return list(self.ros_communicator.get_latest_yolo_bridge_info().data)
+        else:
+            return None
+
     def get_camera_x_multi_depth(self):
         if self.ros_communicator.get_latest_camera_x_multi_depth() is not None:
             return list(self.ros_communicator.get_latest_camera_x_multi_depth().data)
