@@ -191,10 +191,14 @@ class AutoTaskController:
         # 已正對橋腳後做精修。user 指示：不管翻車/不控速、不判斷下橋，對準後直接全速衝固定時間即可。
         self.task2_bear_class = "bear:far"    # 橋頂熊 class (BEAR_ALIGN 精修用)；far=挑最遠那隻
         self.task2_start_forward_time = 4.0   # 秒：起步先往前一小段 (計時盲推，固定地圖)
-        self.task2_left_turn_time = 1.5       # 秒：左轉把橋帶進視野 (計時粗轉，之後視覺 ALIGN 補精)
-        self.task2_align_timeout = 20.0       # 秒：橋面對準階段安全上限，逾時直接進 BEAR_ALIGN
+        self.task2_left_turn_time = 4.0       # 秒：左轉把橋帶進視野 (計時粗轉，之後視覺 ALIGN 補精)
+        self.task2_align_timeout = 20.0       # 秒：橋面對準/找橋階段安全上限，逾時直接進 BEAR_ALIGN
         self.task2_align_fine = 25.0          # px：橋面 dx / 熊 dx 收斂到此內視為對準 (兩階段共用)
         self.task2_commit_area = 0.30         # bridge area_ratio ≥ 此值 + 置中 = 逼近橋腳正對 → 切熊對齊
+        # 沒看到橋 → SEARCH：先向左掃、沒有再向右、反向時微步向前 (固定地圖把橋找回視野)
+        self.task2_search_sweep = 2.0         # 秒：每個方向的基礎掃描時間
+        self.task2_search_sweep_inc = 1.0     # 秒：每次反向後增加的掃描時間 (擴張擺掃)
+        self.task2_search_creep = 0.3         # 秒：反向時微步向前的時間
         self.task2_bear_align_timeout = 8.0   # 秒：橋頂熊對齊安全上限，逾時(看不到熊)直接全速過橋
         self.task2_drive_time = 10.0          # 秒：對準後全速前進過橋的時間 (上+過+下一氣呵成，不判斷下橋)
 
@@ -908,6 +912,9 @@ class AutoTaskController:
         state = "ALIGN"
         align_t0 = time.time()
         bear_align_t0 = None    # 進 BEAR_ALIGN 第一幀才設 (順便切 target_class 成熊)
+        search_dir = None       # SEARCH 找橋擺掃方向 (None=進 SEARCH 時重置，先 CCW 向左)
+        search_until = None
+        search_dur = self.task2_search_sweep
         dbg_last = 0.0
         print("[Task2] 狀態機啟動 → ALIGN (對準橋面)")
 
@@ -933,7 +940,7 @@ class AutoTaskController:
                     car.update_action("STOP")
                     state = "BEAR_ALIGN"
                 elif not b_found:
-                    car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW")  # 沒看到橋 → 左轉掃找
+                    state = "SEARCH"                                     # 沒看到橋 → 進搜索模式
                 elif b_dx > self.task2_align_fine:
                     car.update_action("CLOCKWISE_ROTATION_SLOW")         # 橋偏右 → 右轉置中
                 elif b_dx < -self.task2_align_fine:
@@ -944,6 +951,35 @@ class AutoTaskController:
                     print(f"[Task2] 橋面對準完成 (dx={b_dx:.0f}, area={b_area:.3f}) → 對齊橋頂熊")
                     car.update_action("STOP")
                     state = "BEAR_ALIGN"
+
+            elif state == "SEARCH":
+                # 沒看到橋 → 擺掃找橋：先向左(CCW)、沒有再向右(CW)，每次反向時微步向前。
+                if (now - align_t0) >= self.task2_align_timeout:
+                    print("[Task2] SEARCH 找橋逾時 → 進 BEAR_ALIGN")
+                    car.update_action("STOP")
+                    state = "BEAR_ALIGN"
+                elif b_found:
+                    car.update_action("STOP")
+                    search_dir = None             # 找到橋 → 重置擺掃，回 ALIGN 對準
+                    state = "ALIGN"
+                else:
+                    if search_dir is None:
+                        search_dir = "CCW"        # 先向左找
+                        search_dur = self.task2_search_sweep
+                        search_until = now + search_dur
+                        print("[Task2] 沒找到橋 → SEARCH (先向左掃)")
+                    elif now >= search_until:
+                        search_dir = "CW" if search_dir == "CCW" else "CCW"  # 反向：左→右→左…
+                        search_dur += self.task2_search_sweep_inc
+                        search_until = now + search_dur
+                        self._timed_action(
+                            "FORWARD_SLOW", self.task2_search_creep, stop_event
+                        )                          # 反向時微步向前，把橋帶進視野
+                        print(f"[Task2] SEARCH 反向 → {search_dir}, 掃 {search_dur:.1f}s (微步前進)")
+                    car.update_action(
+                        "COUNTERCLOCKWISE_ROTATION_SLOW" if search_dir == "CCW"
+                        else "CLOCKWISE_ROTATION_SLOW"
+                    )
 
             elif state == "BEAR_ALIGN":
                 # 已正對橋腳 → 切換對齊橋頂熊精修過橋瞄準點。第一幀切 target_class 成熊。
