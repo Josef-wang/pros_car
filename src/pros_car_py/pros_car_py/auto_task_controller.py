@@ -185,21 +185,23 @@ class AutoTaskController:
         self.task3_return_home = True
 
         # ---- Task 2 (上下橋) ----
-        # 策略(固定地圖、無 IMU)：起步往前一小段 → 左轉把橋帶進視野 → ALIGN 對準橋面(用 bridge_info
-        # 整片質心 dx) 並前進到橋腳(area_ratio 夠大) → BEAR_ALIGN 切換對齊橋頂熊(精修過橋瞄準點)
-        # → 對準後全速前進固定秒數過橋(上+過+下一氣呵成)。橋面對準用 mask(遠處非橋熊會誤導),熊只在
-        # 已正對橋腳後做精修。user 指示：不管翻車/不控速、不判斷下橋，對準後直接全速衝固定時間即可。
-        self.task2_bear_class = "bear:far"    # 橋頂熊 class (BEAR_ALIGN 精修用)；far=挑最遠那隻
+        # 策略(固定地圖、無 IMU)：起步往前一小段 → 左轉把橋帶進視野 → ALIGN 對準橋面 → 對準後全速前進
+        # 固定秒數過橋(上+過+下一氣呵成)。對準改用近/遠帶把「車頭正」與「對準橋腳中央」拆開(整片質心
+        # 會被近端寬處主導，車斜了也看不出來，導致一側輪胎壓到斜坡邊卡住)：
+        #   轉向追 dx_far(橋面中線遠點，純追蹤)；commit 要求 |dx_near|(站在橋腳中央) 且
+        #   |skew = dx_far - dx_near|(車頭與橋中軸平行) 雙條件都過 → 又正又中央才上橋。
+        # user 指示：先拿掉對齊熊那段；不管翻車/不控速、不判斷下橋，對準後直接全速衝固定時間。
         self.task2_start_forward_time = 4.0   # 秒：起步先往前一小段 (計時盲推，固定地圖)
         self.task2_left_turn_time = 4.0       # 秒：左轉把橋帶進視野 (計時粗轉，之後視覺 ALIGN 補精)
-        self.task2_align_timeout = 20.0       # 秒：橋面對準/找橋階段安全上限，逾時直接進 BEAR_ALIGN
-        self.task2_align_fine = 25.0          # px：橋面 dx / 熊 dx 收斂到此內視為對準 (兩階段共用)
-        self.task2_commit_area = 0.30         # bridge area_ratio ≥ 此值 + 置中 = 逼近橋腳正對 → 切熊對齊
+        self.task2_align_timeout = 20.0       # 秒：橋面對準/找橋階段安全上限，逾時直接全速過橋
+        self.task2_align_fine = 25.0          # px：dx_far(中線遠點)收斂到此內才停止轉向、開始微步前進
+        self.task2_commit_area = 0.30         # bridge area_ratio ≥ 此值 = 已逼近橋腳 (commit 前置條件)
+        self.task2_near_tol = 25.0            # px：|dx_near| 容差 — 橋腳正前方橫向對準 (站在橋腳中央)
+        self.task2_skew_tol = 30.0            # px：|dx_far - dx_near| 容差 — 車頭與橋中軸平行 (不歪斜)
         # 沒看到橋 → SEARCH：先向左掃、沒有再向右、反向時微步向前 (固定地圖把橋找回視野)
         self.task2_search_sweep = 2.0         # 秒：每個方向的基礎掃描時間
         self.task2_search_sweep_inc = 1.0     # 秒：每次反向後增加的掃描時間 (擴張擺掃)
         self.task2_search_creep = 0.3         # 秒：反向時微步向前的時間
-        self.task2_bear_align_timeout = 8.0   # 秒：橋頂熊對齊安全上限，逾時(看不到熊)直接全速過橋
         self.task2_drive_time = 10.0          # 秒：對準後全速前進過橋的時間 (上+過+下一氣呵成，不判斷下橋)
 
     # ==========================================
@@ -886,9 +888,9 @@ class AutoTaskController:
         return (b[0] == 1.0, b[1], b[2], b[3], b[4], b[5], b[6])
 
     def _task2_loop(self, stop_event):
-        """橋：起步前進+左轉把橋帶進視野 → 對準橋面(bridge_info 整片質心 dx)並前進到橋腳
-        → 對準後全速前進固定秒數過橋(上+過+下一氣呵成，不判斷下橋)。完全用橋面 mask、不看熊。
-        固定地圖、無 IMU；不控速/不管翻車 (user 指示)。"""
+        """橋：起步前進+左轉把橋帶進視野 → 對準橋面(近/遠帶雙條件：dx_far 追蹤轉向 +
+        |dx_near| 橋腳置中 + |skew| 車頭正)→ 又正又中央後全速前進固定秒數過橋(上+過+下一氣呵成，
+        不判斷下橋)。完全用橋面 mask、不看熊。固定地圖、無 IMU；不控速/不管翻車 (user 指示)。"""
         car = self.car_controller
         dp = self.data_processor
 
@@ -908,10 +910,9 @@ class AutoTaskController:
         )
         car.update_action("STOP")
 
-        # 2) ALIGN 對準橋面 → BEAR_ALIGN 對齊橋頂熊 → 全速過橋
+        # 2) ALIGN 對準橋面 (近/遠帶雙條件) → 全速過橋
         state = "ALIGN"
         align_t0 = time.time()
-        bear_align_t0 = None    # 進 BEAR_ALIGN 第一幀才設 (順便切 target_class 成熊)
         search_dir = None       # SEARCH 找橋擺掃方向 (None=進 SEARCH 時重置，先 CCW 向左)
         search_until = None
         search_dur = self.task2_search_sweep
@@ -922,42 +923,44 @@ class AutoTaskController:
             now = time.time()
             (b_found, b_dx, b_dx_near, b_dx_far,
              b_area, b_cover, b_top) = self._read_bridge_info(dp)
-            info = dp.get_yolo_target_info()        # 橋頂熊 (BEAR_ALIGN 用)
-            bear_found = info is not None and info[0] == 1.0
-            bear_dx = info[2] if info is not None else 0.0
+            skew = b_dx_far - b_dx_near      # 車頭歪斜量：橋中軸在畫面是否直直往上
             prev_state = state
 
             if now - dbg_last >= 1.0:
                 dbg_last = now
                 print(f"[Task2][dbg] state={state} bridge_found={int(b_found)} "
-                      f"dx={b_dx:.0f} area={b_area:.3f} | bear_found={int(bear_found)} "
-                      f"bear_dx={bear_dx:.0f}")
+                      f"dx_far={b_dx_far:.0f} dx_near={b_dx_near:.0f} skew={skew:.0f} "
+                      f"area={b_area:.3f}")
 
             if state == "ALIGN":
-                # 對準橋面(整片質心 dx)→ 置中後前進到橋腳(area 夠大)→ 切換對齊橋頂熊。完全用橋面 mask。
+                # 近/遠帶雙條件：轉向追 dx_far(中線遠點，純追蹤會把橫向偏移在平地上收斂)，
+                # commit 要求 |dx_near|(橋腳置中) 且 |skew|(車頭正) 都過 → 又正又中央才上橋。
                 if (now - align_t0) >= self.task2_align_timeout:
-                    print("[Task2] 橋面對準逾時 → 進 BEAR_ALIGN")
+                    print("[Task2] 橋面對準逾時 → 全速過橋")
                     car.update_action("STOP")
-                    state = "BEAR_ALIGN"
+                    state = "DRIVE"
                 elif not b_found:
                     state = "SEARCH"                                     # 沒看到橋 → 進搜索模式
-                elif b_dx > self.task2_align_fine:
-                    car.update_action("CLOCKWISE_ROTATION_SLOW")         # 橋偏右 → 右轉置中
-                elif b_dx < -self.task2_align_fine:
-                    car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW")  # 橋偏左 → 左轉置中
-                elif b_area < self.task2_commit_area:
-                    car.update_action("FORWARD_SLOW")                    # 已置中但還遠 → 前進到橋腳
+                elif b_dx_far > self.task2_align_fine:
+                    car.update_action("CLOCKWISE_ROTATION_SLOW")         # 中線遠點偏右 → 右轉追上
+                elif b_dx_far < -self.task2_align_fine:
+                    car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW")  # 中線遠點偏左 → 左轉追上
+                elif (b_area < self.task2_commit_area
+                      or abs(b_dx_near) > self.task2_near_tol
+                      or abs(skew) > self.task2_skew_tol):
+                    car.update_action("FORWARD_SLOW")                    # 對到遠點但還沒又正又中央 → 微步前進收斂
                 else:
-                    print(f"[Task2] 橋面對準完成 (dx={b_dx:.0f}, area={b_area:.3f}) → 對齊橋頂熊")
+                    print(f"[Task2] 橋面對準完成 (near={b_dx_near:.0f}, skew={skew:.0f}, "
+                          f"area={b_area:.3f}) → 全速過橋")
                     car.update_action("STOP")
-                    state = "BEAR_ALIGN"
+                    state = "DRIVE"
 
             elif state == "SEARCH":
                 # 沒看到橋 → 擺掃找橋：先向左(CCW)、沒有再向右(CW)，每次反向時微步向前。
                 if (now - align_t0) >= self.task2_align_timeout:
-                    print("[Task2] SEARCH 找橋逾時 → 進 BEAR_ALIGN")
+                    print("[Task2] SEARCH 找橋逾時 → 全速過橋")
                     car.update_action("STOP")
-                    state = "BEAR_ALIGN"
+                    state = "DRIVE"
                 elif b_found:
                     car.update_action("STOP")
                     search_dir = None             # 找到橋 → 重置擺掃，回 ALIGN 對準
@@ -980,28 +983,6 @@ class AutoTaskController:
                         "COUNTERCLOCKWISE_ROTATION_SLOW" if search_dir == "CCW"
                         else "CLOCKWISE_ROTATION_SLOW"
                     )
-
-            elif state == "BEAR_ALIGN":
-                # 已正對橋腳 → 切換對齊橋頂熊精修過橋瞄準點。第一幀切 target_class 成熊。
-                # 熊暫時沒看到就原地等(橋已對準，靠 timeout 落 DRIVE)；逾時也直接過橋。
-                if bear_align_t0 is None:
-                    self.ros_communicator.publish_yolo_target_class(self.task2_bear_class)
-                    bear_align_t0 = now
-                    print("[Task2] 切換對齊橋頂熊 (FINE_ALIGN)")
-                if (now - bear_align_t0) >= self.task2_bear_align_timeout:
-                    print("[Task2] 熊對齊逾時(看不到熊) → 全速過橋")
-                    car.update_action("STOP")
-                    state = "DRIVE"
-                elif bear_found and abs(bear_dx) <= self.task2_align_fine:
-                    print(f"[Task2] 熊對齊完成 (bear_dx={bear_dx:.0f}) → 全速過橋")
-                    car.update_action("STOP")
-                    state = "DRIVE"
-                elif bear_found and bear_dx > self.task2_align_fine:
-                    car.update_action("CLOCKWISE_ROTATION_SLOW")         # 熊偏右 → 右轉置中
-                elif bear_found and bear_dx < -self.task2_align_fine:
-                    car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW")  # 熊偏左 → 左轉置中
-                else:
-                    car.update_action("STOP")                            # 熊暫時沒看到 → 原地等
 
             elif state == "DRIVE":
                 # 對準完成 → 直接全速前進固定秒數過橋 (上+過+下一氣呵成，不判斷下橋；user 指示)
