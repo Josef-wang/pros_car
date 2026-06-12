@@ -1285,19 +1285,22 @@ class AutoTaskController:
 
     def _front_depth_open(self):
         """前向深度是否『看穿』(門開→看到遠方)。回 (is_open|None, 描述)。
-        取 multi_depth 中央前向 [7:13]，過半有效值 ≥ door_open_depth = 看穿=開。
+        取 multi_depth 中央前向 **[6:14]**(放寬，涵蓋門口更寬一段，不只正中央那撮)。判據：
+        這段有效值中**只要有任一格 < door_open_depth(近回波=還有一葉關著)就算沒全開** —— 對「車身
+        偏一邊、中央剛好穿過已開那道縫」的誤判免疫(偏移時關著那葉的邊緣會落在這段、抓得到)。
         全失效時無法判別(可能太近壓在門上、也可能看穿)→ 回 None 交由位移裁決。"""
         dp = self.data_processor
         depths = dp.get_camera_x_multi_depth()
-        if not depths or len(depths) < 13:
+        if not depths or len(depths) < 14:
             return None, "拿不到 multi_depth"
-        front = depths[7:13]
+        front = depths[6:14]
         valid = [d for d in front if d is not None and d > 0.0]
         if not valid:
             return None, "前向全失效(太近或看穿，無法判別)"
-        far = [d for d in valid if d >= self.door_open_depth]
-        is_open = len(far) >= max(1, (len(valid) + 1) // 2)
-        return is_open, f"前向有效={[round(d, 2) for d in valid]} ≥{self.door_open_depth} 佔 {len(far)}/{len(valid)}"
+        near = [d for d in valid if d < self.door_open_depth]
+        is_open = len(near) == 0        # 整段不得有近回波；任一格近=還有一葉沒全開
+        return is_open, (f"前向有效={[round(d, 2) for d in valid]} 近回波"
+                         f"(<{self.door_open_depth})={[round(d, 2) for d in near]}")
 
     def _verify_door_open(self, start_xy):
         """(b) 判斷門有沒有全開：AMCL 前推位移為主、前向深度為輔。回 True=判定已開。
