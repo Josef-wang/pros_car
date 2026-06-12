@@ -198,10 +198,9 @@ class AutoTaskController:
         self.task2_commit_area = 0.30         # bridge area_ratio ≥ 此值 = 已逼近橋腳 (commit 前置條件)
         self.task2_near_tol = 18.0            # px：|dx_near| 容差 — 橋腳正前方橫向對準 (站在橋腳中央)
         self.task2_skew_tol = 20.0            # px：|dx_far - dx_near| 容差 — 車頭與橋中軸平行 (不歪斜)
-        # 沒看到橋 → SEARCH：先向左掃、沒有再向右、反向時微步向前 (固定地圖把橋找回視野)
-        self.task2_search_sweep = 2.0         # 秒：每個方向的基礎掃描時間
-        self.task2_search_sweep_inc = 1.0     # 秒：每次反向後增加的掃描時間 (擴張擺掃)
-        self.task2_search_creep = 0.3         # 秒：反向時微步向前的時間
+        # 沒看到橋 → SEARCH：以進 SEARCH 當下車頭為中心，左右 90° 搖擺找橋，到端點反向時微步向前
+        self.task2_search_sweep_deg = 90.0    # 度：搖擺幅度 — 向左轉到 +此值、向右轉到 -此值 (用 AMCL yaw)
+        self.task2_search_creep = 0.3         # 秒：到端點反向時微步向前的時間 (把橋帶進視野)
         self.task2_drive_time = 10.0          # 秒：對準後全速前進過橋的時間 (上+過+下一氣呵成，不判斷下橋)
 
     # ==========================================
@@ -913,9 +912,8 @@ class AutoTaskController:
         # 2) ALIGN 對準橋面 (近/遠帶雙條件) → 全速過橋
         state = "ALIGN"
         align_t0 = time.time()
-        search_dir = None       # SEARCH 找橋擺掃方向 (None=進 SEARCH 時重置，先 CCW 向左)
-        search_until = None
-        search_dur = self.task2_search_sweep
+        search_dir = None         # SEARCH 搖擺方向 (None=進 SEARCH 時重置，先 CCW 向左)
+        search_center_yaw = None  # SEARCH 左右搖擺的中心車頭 yaw (進 SEARCH 當下記)
         dbg_last = 0.0
         print("[Task2] 狀態機啟動 → ALIGN (對準橋面)")
 
@@ -956,29 +954,33 @@ class AutoTaskController:
                     state = "DRIVE"
 
             elif state == "SEARCH":
-                # 沒看到橋 → 擺掃找橋：先向左(CCW)、沒有再向右(CW)，每次反向時微步向前。
+                # 沒看到橋 → 左右 90° 搖擺找橋：以進 SEARCH 當下車頭為中心，先向左 CCW 轉到 +sweep_deg、
+                # 再向右 CW 轉到 -sweep_deg，來回擺掃；到端點反向時微步向前把橋帶進視野。用 AMCL yaw 追角度。
                 if (now - align_t0) >= self.task2_align_timeout:
                     print("[Task2] SEARCH 找橋逾時 → 全速過橋")
                     car.update_action("STOP")
                     state = "DRIVE"
                 elif b_found:
                     car.update_action("STOP")
-                    search_dir = None             # 找到橋 → 重置擺掃，回 ALIGN 對準
+                    search_dir = None             # 找到橋 → 重置搖擺，回 ALIGN 對準
                     state = "ALIGN"
                 else:
+                    cur_yaw = self._current_yaw()
                     if search_dir is None:
                         search_dir = "CCW"        # 先向左找
-                        search_dur = self.task2_search_sweep
-                        search_until = now + search_dur
-                        print("[Task2] 沒找到橋 → SEARCH (先向左掃)")
-                    elif now >= search_until:
-                        search_dir = "CW" if search_dir == "CCW" else "CCW"  # 反向：左→右→左…
-                        search_dur += self.task2_search_sweep_inc
-                        search_until = now + search_dur
-                        self._timed_action(
-                            "FORWARD_SLOW", self.task2_search_creep, stop_event
-                        )                          # 反向時微步向前，把橋帶進視野
-                        print(f"[Task2] SEARCH 反向 → {search_dir}, 掃 {search_dur:.1f}s (微步前進)")
+                        print("[Task2] 沒找到橋 → SEARCH (左右 90° 搖擺，先向左)")
+                    if search_center_yaw is None and cur_yaw is not None:
+                        search_center_yaw = cur_yaw   # yaw 一可用就鎖中心 (None 時退化成連續旋轉)
+                    if cur_yaw is not None and search_center_yaw is not None:
+                        off = ((cur_yaw - search_center_yaw + 180.0) % 360.0) - 180.0
+                        if ((search_dir == "CCW" and off >= self.task2_search_sweep_deg) or
+                                (search_dir == "CW" and off <= -self.task2_search_sweep_deg)):
+                            search_dir = "CW" if search_dir == "CCW" else "CCW"  # 到端點反向
+                            self._timed_action(
+                                "FORWARD_SLOW", self.task2_search_creep, stop_event
+                            )                      # 反向時微步向前，把橋帶進視野
+                            print(f"[Task2] SEARCH 到 ±{self.task2_search_sweep_deg:.0f}° 端點 "
+                                  f"→ 反向 {search_dir} (微步前進)")
                     car.update_action(
                         "COUNTERCLOCKWISE_ROTATION_SLOW" if search_dir == "CCW"
                         else "CLOCKWISE_ROTATION_SLOW"
