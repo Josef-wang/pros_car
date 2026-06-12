@@ -196,8 +196,8 @@ class AutoTaskController:
         self.task2_align_timeout = 20.0       # 秒：橋面對準/找橋階段安全上限，逾時直接全速過橋
         self.task2_align_fine = 25.0          # px：dx_far(中線遠點)收斂到此內才停止轉向、開始微步前進
         self.task2_commit_area = 0.30         # bridge area_ratio ≥ 此值 = 已逼近橋腳 (commit 前置條件)
-        self.task2_near_tol = 25.0            # px：|dx_near| 容差 — 橋腳正前方橫向對準 (站在橋腳中央)
-        self.task2_skew_tol = 30.0            # px：|dx_far - dx_near| 容差 — 車頭與橋中軸平行 (不歪斜)
+        self.task2_near_tol = 18.0            # px：|dx_near| 容差 — 橋腳正前方橫向對準 (站在橋腳中央)
+        self.task2_skew_tol = 20.0            # px：|dx_far - dx_near| 容差 — 車頭與橋中軸平行 (不歪斜)
         # 沒看到橋 → SEARCH：先向左掃、沒有再向右、反向時微步向前 (固定地圖把橋找回視野)
         self.task2_search_sweep = 2.0         # 秒：每個方向的基礎掃描時間
         self.task2_search_sweep_inc = 1.0     # 秒：每次反向後增加的掃描時間 (擴張擺掃)
