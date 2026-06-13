@@ -62,10 +62,14 @@ class AutoTaskController:
         # 放開前的收尾：Nav2 在離起點 0.5m 處就停、且朝向常平行邊界 → 盲推也進不了區。
         # 改用『閉環朝起點補完最後一段』(_creep_to_point)：用 AMCL 回授轉向起點再前進，
         # 直到離起點 ≤ release_creep_tol 才放熊。方向永遠朝起點(=區內)，不靠 Nav2 停下時朝向。
-        self.release_creep_tol = 0.2    # 公尺：補到離起點這麼近才放 (太遠不進區→調小；衝過頭→調大)
+        self.release_creep_tol = 0.05   # 公尺：補到離起點這麼近才放 (太遠不進區→調小；衝過頭→調大)
         self.release_creep_timeout = 6.0  # 秒：閉環補位安全上限
-        # 補位後額外的盲推前進秒數，預設 0(閉環已到位)；若還想把熊再往區內推一點再開
-        self.release_creep_time = 0.0   # 秒
+        # 轉到場外後、放熊前再前推的秒數：把熊往場外側的計分區內多送一截再放 (0=不推)。
+        # 此時車頭已朝場外，前推=往區裡送，治「放下位置差一截、落在區外」。
+        self.release_push_time = 0.8    # 秒 (轉到場外後 FORWARD_SLOW 前推)
+        # 放熊前車頭要轉到的方向 = start_yaw + 此偏移(度)。計分區在『場外』側,手臂要伸進區裡
+        # → 車面向場外 = 相對 spawn(start_yaw) 轉 180°。放完再轉回 start_yaw(home 姿態)。
+        self.release_yaw_offset = 200.0  # 度：放熊朝向相對 start_yaw 的偏移 (場外≈180，多轉一點)
         # task 啟動時自動重發 /initialpose 把 AMCL 重定位於起點。
         # ⚠️ 前提：開 task 時車一定在 spawn 起點 (否則會把定位設錯)。
         # respawn 車後不必重開 localization。座標 = 起點 (0,0,0)。
@@ -115,6 +119,9 @@ class AutoTaskController:
         self.regrasp_max_attempts = 3   # 重抓上限，超過放棄
         self.regrasp_reach_step = 0.015 # m：每次重抓 reach_bias 增量 (+=夾爪往前伸更多，治搆不到)
         self.regrasp_creep_time = 0.43  # 秒：重抓時的盲推時間 (比第一次 0.3 大=重抓更靠近，治搆不到)
+        # 重抓時 FINE_ALIGN 改用更嚴的置中門檻：首抓 align_fine 較鬆(避免一直微調抓不準)，
+        # 但置中不夠正正是要重抓的主因 → 重抓時收緊，逼車真的對正再抓，別累積位姿亂跑。
+        self.regrasp_align_fine = 22.0  # px：重抓時 FINE_ALIGN 置中門檻 (比首抓 align_fine 緊)
 
         # ---- Task 3 (開門) ----
         # 起步路標：朝門邊兩熊前進把門帶進視野。門邊熊在遠處(>YOLO max_target_distance)，
@@ -144,16 +151,18 @@ class AutoTaskController:
         self.knob_search_max_creep = 2.0    # 秒：SEARCH 累計前挪上限
         # timeout 純安全網：連續慢速接近(從 ~4m 邊轉邊前進)要夠長，別在還沒到門前就誤切。
         self.landmark_timeout = 35.0        # 秒：朝路標前進的安全上限，逾時才 fallback 切 knob
-        # 卡住脫困：起點(Task1 收尾姿態)左前輪常稍微被橋卡住 → 朝熊前推但 YOLO 距離不縮短。
-        # 偵測到「committed 後持續前推但距離沒縮短」就做一段扭動(後退→右轉→前進→左轉)把輪子
-        # 挪開，再切回原本偵測熊模式重新接近。各段全速取得脫困力道，左右轉對稱大致還原航向。
+        # 卡住脫困：起點(尤其串接 1→3→2)左前輪常被橋卡住 → 朝熊前推但 YOLO 距離不縮短。
+        # 偵測到「committed 後持續前推但距離沒縮短」→ 閉環脫困:後退 + 往離開障礙方向轉(左輪卡→右轉)，
+        # 用 AMCL 位移確認真的挪開了;沒挪夠就把後退/轉角逐次加大重試。**不在脫困中前進**(會把輪子
+        # 頂回障礙)、**不轉回來**(交回 APPROACH 用視覺重新對準航向,航向自然修回)。
         self.landmark_stuck_timeout = 2.0   # 秒：committed 後持續前推但距離未縮短超過此時間 = 卡住
         self.landmark_stuck_eps = 0.05      # 公尺：距離至少縮短此值才算有進展(濾 YOLO 距離抖動)
-        # 加長(原 0.2/0.2/0.2)：串接 1→3→2 時 Task3 起點被橋卡更死，脫困要更大力道，後退尤其要久
-        # 才退得出橋緣。注意此為全域,standalone Task3 的脫困也會跟著變長。
-        self.escape_back_time = 0.5         # 秒：脫困後退時間 (退出橋緣，加最多)
-        self.escape_turn_time = 0.3         # 秒：脫困左/右轉時間 (右轉與左轉共用)
-        self.escape_fwd_time = 0.3          # 秒：脫困前進時間
+        self.escape_back_time = 0.5         # 秒：脫困後退基礎時間 (第 n 次 ×n 逐次加大)
+        self.escape_turn_time = 0.3         # 秒：脫困轉離基礎時間 (第 n 次 ×n 逐次加大)
+        self.escape_turn_dir = "CW"         # 脫困轉向:"CW"=右轉(離開左側障礙,實測左輪卡用此)/"CCW"=左轉
+        self.escape_free_dist = 0.15        # 公尺：脫困後 AMCL 位移 ≥ 此值才算真的挪開(否則升級重試)
+        self.escape_max_attempts = 3        # 次：閉環脫困最多重試次數 (每次後退/轉角加大)
+        self.escape_clear_time = 1.0        # 秒：脫困後(已轉離障礙)前推清開卡點再交回追熊，免同角度立刻再卡
         self.knob_standoff = 0.35           # 公尺：壓門前 depth 閉環收斂站距
         # (B) depth 停點收穩：要求連續 N 幀 ≤target 才算到位、連續 M 幀無 depth 才算進盲區停，
         #     避免單幀雜訊提早停 → 停點 run-to-run 一致 (Task1 維持預設 1/3 不受影響)。
@@ -175,13 +184,18 @@ class AutoTaskController:
         # 前推時手臂在 knob 高度上下來回「掃」，補 FINE_ALIGN 左右微誤差 → 提高壓到把手機率。
         self.door_swing = True              # True=前推時手臂上下擺動；False=固定壓住
         self.door_swing_amp = 0.06          # 公尺：從壓下 z 往上掃的幅度 (掃不到→加大、頂到門→減小)
-        # (b) 推完驗證有沒有全開。實測：開門時車幾乎不前進 → 前向深度『看穿』為主判據
-        #     (開=前向~4m、關=一片~0.4m 近牆)，位移只當深度全失效時的 fallback。沒開→補推(迴圈)。
-        self.door_verify = True             # True=推完做一次深度檢查、沒全開才補推
-        # 門全開時畫面右側仍有 20~25% 是門 → 深度檢查易誤判沒開,故最多補推一次、且補推後不再檢查。
-        self.door_repush_time = 8.0          # 秒：沒全開時補推一次的時間 (補推後不再驗證、直接收尾)
-        self.door_open_depth = 1.0          # 公尺：前向過半 sample ≥ 此值=看穿=已開 (主判據)
-        self.door_clear_dist = 0.5          # 公尺：fallback——深度全失效時改看 AMCL 前推位移
+        # (b) 脈衝式開門：推一小段 → 停 → 查前向深度看穿；一偵測到門讓開就停，別黏著正在旋轉的
+        #     門被它的邊緣掃歪/帶著右移(門往右開、車一直頂著就被掃向右)。推到看穿或累計達 push_time。
+        self.door_verify = True             # True=偵測門看穿就停(脈衝停-on-open)；False=推滿 door_push_time
+        self.door_push_pulse = 0.5          # 秒：每次脈衝前推時間 (越短越不黏著門、越不被帶歪)
+        self.door_push_settle = 0.25        # 秒：脈衝間停頓，讓門擺開 + 深度穩定再判
+        # 「看穿」只代表門裂開一條縫(中央能透視)，不等於全開 → 偵測到看穿後再補一段把門推到全開。
+        # 平常脈衝限制拖曳，只有確認門鬆動才補這一下(短、且推完會轉回 entry_yaw 修歪)。
+        self.door_finish_push_time = 3.0    # 秒：偵測門裂開後補推到全開的時間 (0=看穿就停、不補)
+        self.door_open_depth = 1.0          # 公尺：前向 [6:14] 任一格 < 此值=還有一葉關著=沒全開
+        self.door_clear_dist = 0.5          # 公尺：(保留) 深度全失效時改看 AMCL 前推位移
+        # 推完先把被門掃歪的車頭轉回「進門前 yaw」再直線後退 (別歪著退卡門外、回不了原點)。
+        self.door_reorient_after_push = True
         # 門推開後先全速後退脫離門口，再接導航回原點 (免卡在門上/與門框糾纏)。
         self.door_back_time = 4.0           # 秒：開門後全速後退的時間
         # 開門完成後回起點 (需 localization_unity/AMCL + Nav2)。重用 Task1 回程積木，終點=起點(0,0)。
@@ -462,6 +476,8 @@ class AutoTaskController:
                     car.update_action("FORWARD_SLOW")
 
             elif state == "FINE_ALIGN":
+                # 重抓時收緊置中門檻(置中不夠正是重抓主因)；首抓維持較鬆的 align_fine
+                fine_tol = self.regrasp_align_fine if grasp_attempt > 0 else self.align_fine
                 if near_lost:
                     if was_close and was_centered:
                         car.update_action("STOP")
@@ -479,14 +495,14 @@ class AutoTaskController:
                         car.update_action("STOP")
                         search_dir = None
                         state = "SEARCH"
-                elif delta_x > self.align_fine:
+                elif delta_x > fine_tol:
                     car.update_action("CLOCKWISE_ROTATION_SLOW")        # 精對齊：右轉
-                elif delta_x < -self.align_fine:
+                elif delta_x < -fine_tol:
                     car.update_action("COUNTERCLOCKWISE_ROTATION_SLOW") # 精對齊：左轉
                 else:
                     car.update_action("STOP")
                     if grasp_attempt > 0:
-                        state = "GRASP"      # 重抓：已重新置中，直接抓，不重做 5 秒觀察
+                        state = "GRASP"      # 重抓：已用更嚴門檻重新置中，直接抓，不重做 5 秒觀察
                     else:
                         observe_start = time.time()
                         state = "OBSERVE"
@@ -617,14 +633,19 @@ class AutoTaskController:
                     [self.start_x, self.start_y], stop_event,
                     tol=self.release_creep_tol, timeout=self.release_creep_timeout,
                 )
-                if self.release_creep_time > 0:  # 可選：補位後再往區內推一點
-                    print(f"[Task1] 放開前再盲推 {self.release_creep_time:.1f}s")
-                    self._timed_action("FORWARD_SLOW", self.release_creep_time, stop_event)
+                car.update_action("STOP")
+                # 先面向場外(start_yaw+release_yaw_offset，預設180)再放熊：計分區在場外側，
+                # 手臂要伸進區裡 → 轉到場外、手臂帶著熊掃進區，轉到位才放 (治「車身到原點但
+                # 手臂還指區外就放掉」)。_orient_to_yaw 進度感知會轉到位、不會旋轉不夠。
+                self._orient_to_yaw(self.start_yaw + self.release_yaw_offset, stop_event)
+                # 轉到場外後再前推一截，把熊送進場外側的計分區內再放
+                if self.release_push_time > 0 and not stop_event.is_set():
+                    print(f"[Task1] 面向場外後前推 {self.release_push_time:.1f}s 把熊送進區")
+                    self._timed_action("FORWARD_SLOW", self.release_push_time, stop_event)
                 car.update_action("STOP")
                 arm.release()
-                # 回正車頭：_creep_to_point 只保證位置，朝向會指著起點(貼牆)方向。
-                # 轉回 start_yaw(=spawn 朝向，面向場內)，讓車停回 home 姿態，
-                # 後續 Task2/3「從起點直行」才走得出去。
+                arm.reset_arm()   # 收手，免接著回正旋轉時掃到剛放下的熊
+                # 放完轉回 start_yaw(=spawn 朝向，面向場內)，回 home 姿態，後續 task「從起點直行」出得去。
                 self._orient_to_yaw(self.start_yaw, stop_event)
                 state = "DONE"
 
@@ -858,23 +879,30 @@ class AutoTaskController:
                 state = "PUSH"
 
             elif state == "PUSH":
-                # 手臂維持下壓(不收回)，直接全速 FORWARD(=手動 w 的力道)一路前推開門。
+                # 手臂維持下壓(不收回)，脈衝式 FORWARD 一路前推開門 (推一小段→停→查看穿)。
                 # door_swing：前推同時讓手臂在 knob 高度上下來回掃，補 FINE_ALIGN 左右微誤差。
-                push_start = self._current_xy()     # 記推前位置，驗證用
-                print(f"[Task3] 壓住全速前推開門 {self.door_push_time:.1f}s"
-                      + ("，手臂上下擺動" if self.door_swing else ""))
-                self._push_with_swing(self.door_push_time, stop_event, self.door_swing)
-                arm.reset_arm()                 # 開完才收手，免拖門/擋回程
-                # (b) 驗證有沒有全開：深度看穿為主、位移為輔。沒開→補推一次後直接收尾。
-                # 門全開時畫面右側仍有 20~25% 是門 → 深度檢查會誤判沒開,故最多補推一次、
-                # 且補推後不再檢查(否則會被右側的門一直判沒開、無謂多推)。
+                push_start = self._current_xy()     # 記推前位置(備查)
+                entry_yaw = self._current_yaw()     # 記進門前車頭，推完轉回(修被門掃歪/帶右走)
                 if self.door_verify:
-                    opened = self._verify_door_open(push_start)
-                    if not opened and not stop_event.is_set():
-                        print(f"[Task3] 判定門沒全開 → 補推一次 "
-                              f"({self.door_repush_time:.1f}s，補推後不再檢查)")
-                        self._push_with_swing(self.door_repush_time, stop_event, self.door_swing)
-                        arm.reset_arm()
+                    # 脈衝推 + 偵測門看穿就停：門往右開、車一直頂著會被門邊緣掃向右 →
+                    # 每次只頂一小段、一偵測到門讓開就停，把「被門帶著走」的接觸時間壓到最短。
+                    print(f"[Task3] 脈衝式前推開門 (每次{self.door_push_pulse:.1f}s，最多{self.door_push_time:.1f}s)"
+                          + ("，手臂上下擺動" if self.door_swing else ""))
+                    opened = self._push_until_open(self.door_push_time, stop_event, self.door_swing)
+                    # 看穿=門裂開，不等於全開 → 補推一段把門推到全開 (脈衝平常限制拖曳，只補這一下)
+                    if opened and self.door_finish_push_time > 0 and not stop_event.is_set():
+                        print(f"[Task3] 門已裂開 → 補推 {self.door_finish_push_time:.1f}s 推到全開")
+                        self._push_with_swing(self.door_finish_push_time, stop_event, self.door_swing)
+                else:
+                    print(f"[Task3] 壓住全速前推開門 {self.door_push_time:.1f}s"
+                          + ("，手臂上下擺動" if self.door_swing else ""))
+                    self._push_with_swing(self.door_push_time, stop_event, self.door_swing)
+                arm.reset_arm()                 # 開完才收手，免拖門/擋回程
+                # 推完把被門掃歪的車頭轉回進門角度，再直線後退(別歪著退卡門外)
+                if (self.door_reorient_after_push and entry_yaw is not None
+                        and not stop_event.is_set()):
+                    print(f"[Task3] 推完轉回進門角度 yaw={entry_yaw:.1f}° (修被門掃歪/帶右走)")
+                    self._orient_to_yaw(entry_yaw, stop_event)
                 # 全速後退脫離門口，再接導航回原點
                 if self.door_back_time > 0:
                     print(f"[Task3] 全速後退脫離門口 {self.door_back_time:.1f}s")
@@ -1095,16 +1123,45 @@ class AutoTaskController:
             time.sleep(0.05)
 
     def _escape_obstacle(self, stop_event):
-        """卡住脫困：朝熊前推但距離不縮(如起點左前輪被橋卡)時，做一段小幅扭動把輪子挪開。
-        後退→右轉→前進→左轉(各 escape_*_time 秒)，全速取得脫困力道；左右轉對稱大致還原航向，
-        結束後交回 APPROACH_LANDMARK 重新偵測接近。扭動太猛/跟丟熊→把動作改 _SLOW 或縮短秒數。"""
-        print("[Task3] ⚠️ 朝熊前推但距離沒縮短，疑似卡住 → 避障扭動(後退→右轉→前進→左轉)")
-        self._timed_action("BACKWARD", self.escape_back_time, stop_event)
-        self._timed_action("CLOCKWISE_ROTATION", self.escape_turn_time, stop_event)
-        self._timed_action("FORWARD", self.escape_fwd_time, stop_event)
-        self._timed_action("COUNTERCLOCKWISE_ROTATION", self.escape_turn_time, stop_event)
-        self.car_controller.update_action("STOP")
-        print("[Task3] 避障扭動結束 → 切回偵測熊模式")
+        """卡住脫困(閉環、驗證、升級)：朝熊前推但距離不縮(如起點左前輪被橋卡)時，
+        後退 + 往離開障礙方向轉(escape_turn_dir，預設右轉因實測左輪卡)，用 AMCL 位移確認真的
+        挪開了(≥escape_free_dist);沒挪夠就把後退/轉角逐次加大重試，最多 escape_max_attempts 次。
+        **不在脫困中前進**(會把輪子頂回障礙)、**不轉回來**(交回 APPROACH 用視覺重新對準航向)。"""
+        car = self.car_controller
+        turn = ("CLOCKWISE_ROTATION" if self.escape_turn_dir == "CW"
+                else "COUNTERCLOCKWISE_ROTATION")
+        print(f"[Task3] ⚠️ 朝熊前推但距離沒縮短，疑似卡住 → 閉環脫困 "
+              f"(後退+{self.escape_turn_dir}轉，AMCL 驗證位移)")
+        freed = False
+        for attempt in range(1, self.escape_max_attempts + 1):
+            scale = attempt                          # 第 n 次力道 ×n (逐次加大)
+            before = self._current_xy()
+            self._timed_action("BACKWARD", self.escape_back_time * scale, stop_event)
+            self._timed_action(turn, self.escape_turn_time * scale, stop_event)
+            car.update_action("STOP")
+            if stop_event.is_set():
+                return
+            after = self._current_xy()
+            if before is None or after is None:
+                print(f"[Task3] 脫困第 {attempt} 次：無 AMCL 無法驗證位移 → 視為脫困、交回接近")
+                freed = True
+                break
+            moved = math.hypot(after[0] - before[0], after[1] - before[1])
+            print(f"[Task3] 脫困第 {attempt}/{self.escape_max_attempts} 次：位移={moved:.2f}m "
+                  f"(門檻{self.escape_free_dist})")
+            if moved >= self.escape_free_dist:
+                freed = True
+                break
+        car.update_action("STOP")
+        if freed:
+            print("[Task3] ✅ 已挪開 → 交回 APPROACH 重新偵測接近")
+        else:
+            print(f"[Task3] ⚠️ 脫困 {self.escape_max_attempts} 次仍位移不足 → 仍交回接近(避免卡死)")
+        # 已轉離障礙 → 前推一點清開卡點再交回追熊;不馬上追熊(否則 APPROACH 又把車轉回原角度、同點再卡)
+        if self.escape_clear_time > 0 and not stop_event.is_set():
+            print(f"[Task3] 脫困後前推 {self.escape_clear_time:.1f}s 清開卡點 (不馬上追熊)")
+            self._timed_action("FORWARD_SLOW", self.escape_clear_time, stop_event)
+            car.update_action("STOP")
 
     def _return_to_start(self, start_pose, stop_event):
         print(f"[Task1] RETURN → 回起點 ({start_pose[0]:.2f}, {start_pose[1]:.2f})")
@@ -1311,6 +1368,42 @@ class AutoTaskController:
         if swing_stop is not None:
             swing_stop.set()
             swing_thr.join(timeout=2.0)
+
+    def _push_until_open(self, max_time, stop_event, swing):
+        """脈衝式前推開門：推 door_push_pulse 秒 → 停 door_push_settle 秒 → 查前向深度看穿。
+        一偵測到門讓開(看穿)就停 —— 門往右開時，車一直頂著正在旋轉的門會被它的邊緣掃向右、
+        連帶右移+右偏；每次只頂一小段、看穿就停，把被門帶著走的接觸時間壓到最短。
+        推到看穿或累計達 max_time 為止，回傳 opened(True/False)。
+        swing=True 時整段過程開背景手臂擺動(補左右微誤差)，不隨脈衝起停。"""
+        car = self.car_controller
+        swing_stop = swing_thr = None
+        if swing and self.door_swing_amp > 0:
+            swing_stop = threading.Event()
+            swing_thr = threading.Thread(
+                target=self._arm_swing_loop,
+                args=(self.knob_arm_forward, self.knob_press_z,
+                      self.knob_press_z + self.door_swing_amp, swing_stop),
+                daemon=True,
+            )
+            swing_thr.start()
+        opened = False
+        t0 = time.time()
+        while not stop_event.is_set() and (time.time() - t0) < max_time:
+            self._timed_action("FORWARD", self.door_push_pulse, stop_event)
+            car.update_action("STOP")
+            if self.door_push_settle > 0:
+                time.sleep(self.door_push_settle)   # 停頓讓門擺開 + 深度穩定再判
+            is_open, note = self._front_depth_open()
+            print(f"[Task3] 脈衝推 {self.door_push_pulse:.1f}s 後查看：{note}")
+            if is_open:
+                opened = True
+                print("[Task3] 偵測門已讓開(看穿) → 停止前推，避免被門帶歪")
+                break
+        if swing_stop is not None:
+            swing_stop.set()
+            swing_thr.join(timeout=2.0)
+        car.update_action("STOP")
+        return opened
 
     def _log_depth_profile(self, label):
         """只印前向深度剖面(左緣[0:7]/前[7:13]/右緣[13:20] 各自有效平均 + raw)，
