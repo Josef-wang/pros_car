@@ -354,14 +354,21 @@ class RosCommunicator(Node):
         goal_pose.pose.orientation.w = 1.0
         self.publisher_goal_pose.publish(goal_pose)
 
-    def publish_initial_pose(self, x=0.0, y=0.0, yaw=0.0):
+    def publish_initial_pose(self, x=0.0, y=0.0, yaw=0.0,
+                             attempts=3, interval=0.3, confirm=True, confirm_tol=0.3):
         """重新 anchor AMCL 到指定 map 座標 (預設起點 0,0,0)。
-        car respawn 後 AMCL 定位會錯，發這個即可重置，不必重開 localization。"""
+        car respawn 後 AMCL 定位會錯，發這個即可重置，不必重開 localization。
+
+        硬化:連發 attempts 次 (間隔 interval 秒)，避開 AMCL 剛(重)啟還沒訂閱好 /initialpose
+        的時間窗;confirm=True 時每次發完讀 /amcl_pose 確認位姿已跳到 (x,y) 的 confirm_tol(m) 內，
+        確認到就提早結束。回傳 True=已確認生效 / False=發完仍未確認(AMCL 未起/未收斂/沒在收 amcl_pose)。
+        注意:/initialpose 是 map frame、只重設 AMCL 的『以為在哪』，不會移動車 → 必須在車實體確實
+        位於 (x,y) 時發才正確 (重生點=map 原點 0,0,0)。"""
         import math
+        import time
 
         msg = PoseWithCovarianceStamped()
         msg.header = Header()
-        msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "map"
         msg.pose.pose.position.x = float(x)
         msg.pose.pose.position.y = float(y)
@@ -374,8 +381,32 @@ class RosCommunicator(Node):
         cov[7] = 0.25 * 0.25
         cov[35] = 0.0685
         msg.pose.covariance = cov
-        self.publisher_initialpose.publish(msg)
-        self.get_logger().info(f"已發布 /initialpose 重定位於 ({x}, {y}, yaw={yaw}).")
+
+        ok = False
+        for i in range(max(1, attempts)):
+            msg.header.stamp = self.get_clock().now().to_msg()   # 每次更新時戳
+            self.publisher_initialpose.publish(msg)
+            time.sleep(interval)                                  # 給 AMCL 套用 + 回發 /amcl_pose
+            if not confirm:
+                continue
+            amcl = self.get_latest_amcl_pose()
+            if amcl is not None:
+                dx = amcl.pose.pose.position.x - float(x)
+                dy = amcl.pose.pose.position.y - float(y)
+                if math.hypot(dx, dy) <= confirm_tol:
+                    ok = True
+                    break
+
+        if confirm and not ok:
+            self.get_logger().warn(
+                f"已連發 {attempts} 次 /initialpose ({x},{y},yaw={yaw}) 但未從 /amcl_pose 確認生效 "
+                f"(AMCL 未起/未收斂,或車不在該點)。"
+            )
+        else:
+            self.get_logger().info(
+                f"已{'發布並確認' if confirm else '發布'} /initialpose 重定位於 ({x}, {y}, yaw={yaw})."
+            )
+        return ok
 
     # publish robot arm angle
     def publish_robot_arm_angle(self, angle):

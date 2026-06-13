@@ -149,9 +149,11 @@ class AutoTaskController:
         # 挪開，再切回原本偵測熊模式重新接近。各段全速取得脫困力道，左右轉對稱大致還原航向。
         self.landmark_stuck_timeout = 2.0   # 秒：committed 後持續前推但距離未縮短超過此時間 = 卡住
         self.landmark_stuck_eps = 0.05      # 公尺：距離至少縮短此值才算有進展(濾 YOLO 距離抖動)
-        self.escape_back_time = 0.2         # 秒：脫困後退時間
-        self.escape_turn_time = 0.2         # 秒：脫困左/右轉時間 (右轉與左轉共用)
-        self.escape_fwd_time = 0.2          # 秒：脫困前進時間
+        # 加長(原 0.2/0.2/0.2)：串接 1→3→2 時 Task3 起點被橋卡更死，脫困要更大力道，後退尤其要久
+        # 才退得出橋緣。注意此為全域,standalone Task3 的脫困也會跟著變長。
+        self.escape_back_time = 0.5         # 秒：脫困後退時間 (退出橋緣，加最多)
+        self.escape_turn_time = 0.3         # 秒：脫困左/右轉時間 (右轉與左轉共用)
+        self.escape_fwd_time = 0.3          # 秒：脫困前進時間
         self.knob_standoff = 0.35           # 公尺：壓門前 depth 閉環收斂站距
         # (B) depth 停點收穩：要求連續 N 幀 ≤target 才算到位、連續 M 幀無 depth 才算進盲區停，
         #     避免單幀雜訊提早停 → 停點 run-to-run 一致 (Task1 維持預設 1/3 不受影響)。
@@ -175,10 +177,9 @@ class AutoTaskController:
         self.door_swing_amp = 0.06          # 公尺：從壓下 z 往上掃的幅度 (掃不到→加大、頂到門→減小)
         # (b) 推完驗證有沒有全開。實測：開門時車幾乎不前進 → 前向深度『看穿』為主判據
         #     (開=前向~4m、關=一片~0.4m 近牆)，位移只當深度全失效時的 fallback。沒開→補推(迴圈)。
-        self.door_verify = True             # True=推完判斷開門並在沒開時補推
-        # 判定沒全開時補推:清單每個元素=該次補推秒數,長度=最多補推次數。推到驗證判定開為止。
-        # 門已解鎖、越補越開,故第二次只需短推;補推也讓手臂擺動(door_swing)補左右微誤差。
-        self.door_repush_times = [8.0, 5.0]  # 第1次補推 8s、第2次 5s (共最多 2 次)
+        self.door_verify = True             # True=推完做一次深度檢查、沒全開才補推
+        # 門全開時畫面右側仍有 20~25% 是門 → 深度檢查易誤判沒開,故最多補推一次、且補推後不再檢查。
+        self.door_repush_time = 8.0          # 秒：沒全開時補推一次的時間 (補推後不再驗證、直接收尾)
         self.door_open_depth = 1.0          # 公尺：前向過半 sample ≥ 此值=看穿=已開 (主判據)
         self.door_clear_dist = 0.5          # 公尺：fallback——深度全失效時改看 AMCL 前推位移
         # 門推開後先全速後退脫離門口，再接導航回原點 (免卡在門上/與門框糾纏)。
@@ -222,11 +223,14 @@ class AutoTaskController:
         return False
 
     def reanchor(self):
-        """手動重發 /initialpose 把 AMCL 重定位於起點 (car respawn 後用，免重開 localization)。"""
+        """手動重發 /initialpose 把 AMCL 重定位於起點 (car respawn 後用，免重開 localization)。
+        publish_initial_pose 會連發數次並讀 /amcl_pose 確認;在此把結果回報給 TUI。"""
         print(f"📍 重定位 AMCL 於起點 ({self.start_x}, {self.start_y}, yaw={self.start_yaw})")
-        self.ros_communicator.publish_initial_pose(
+        ok = self.ros_communicator.publish_initial_pose(
             self.start_x, self.start_y, self.start_yaw
         )
+        print("📍 AMCL 已確認跳到起點 ✅" if ok
+              else "📍 ⚠️ 未從 /amcl_pose 確認 (AMCL 未起/未收斂，或車不在原點)")
 
     def _single_task_loops(self):
         """單一 task 名稱 → 對應的狀態機 loop 函式 (start 與 _chain_loop 共用)。"""
@@ -239,7 +243,7 @@ class AutoTaskController:
     # 串接按鈕：依序跑多個 task (每個 task 自己 reanchor 起點 + 結束回原點，故可串)
     _task_chains = {
         "task1→3→2": ["task1", "task3", "task2"],
-        "task3→2→1": ["task3", "task2", "task1"],
+        "task3→1→2": ["task3", "task1", "task2"],
     }
 
     def start(self, task_name):
@@ -307,8 +311,8 @@ class AutoTaskController:
             )
             time.sleep(0.5)  # 給 AMCL 一點時間吃掉新位姿再記起點
 
-        # 只有開啟 RETURN 才需要起點 (避免 latched/殘留的 amcl_pose 誤觸 RELEASE)
-        start_pose = self._get_start_pose() if self.enable_return else None
+        # RETURN/RELEASE 一律瞄寫死的 map 原點 (start_x, start_y)=(0,0)，與 Task2/3 一致、
+        # 且 run-to-run 確定 (不再記錄 AMCL 當下估計起點那個會抖的值)。是否回家只看 enable_return。
         self.ros_communicator.publish_yolo_target_class(self.target_class)
 
         state = "SEARCH"
@@ -554,7 +558,7 @@ class AutoTaskController:
                 if self.grasp_verify:
                     state = "VERIFY"
                 else:
-                    state = "RETURN" if start_pose is not None else "DONE"
+                    state = "RETURN" if self.enable_return else "DONE"
 
             elif state == "VERIFY":
                 # 後退查看：抓完往後退，看前方熊有沒有又出現(還在地上=沒夾到；不見=被夾走=成功)。
@@ -581,7 +585,7 @@ class AutoTaskController:
                 if bear_still_there:
                     state = "REGRASP"
                 else:
-                    state = "RETURN" if start_pose is not None else "DONE"
+                    state = "RETURN" if self.enable_return else "DONE"
 
             elif state == "REGRASP":
                 grasp_attempt += 1
@@ -603,14 +607,14 @@ class AutoTaskController:
                     state = "APPROACH"
 
             elif state == "RETURN":
-                self._return_to_start(start_pose, stop_event)
+                self._return_to_start([self.start_x, self.start_y], stop_event)
                 state = "RELEASE"
 
             elif state == "RELEASE":
                 # Nav2 停在離起點 0.5m 處(常停在計分區邊界外、朝向平行邊界) →
                 # 閉環朝起點補完最後一段，把車(連同前方的熊)帶進區內再放。
                 self._creep_to_point(
-                    [start_pose[0], start_pose[1]], stop_event,
+                    [self.start_x, self.start_y], stop_event,
                     tol=self.release_creep_tol, timeout=self.release_creep_timeout,
                 )
                 if self.release_creep_time > 0:  # 可選：補位後再往區內推一點
@@ -861,21 +865,16 @@ class AutoTaskController:
                       + ("，手臂上下擺動" if self.door_swing else ""))
                 self._push_with_swing(self.door_push_time, stop_event, self.door_swing)
                 arm.reset_arm()                 # 開完才收手，免拖門/擋回程
-                # (b) 驗證有沒有全開：深度看穿為主、位移為輔。沒開→依 door_repush_times 逐次補推
-                #     (推到判定全開為止;補推也讓手臂擺動 door_swing 補左右微誤差)。
+                # (b) 驗證有沒有全開：深度看穿為主、位移為輔。沒開→補推一次後直接收尾。
+                # 門全開時畫面右側仍有 20~25% 是門 → 深度檢查會誤判沒開,故最多補推一次、
+                # 且補推後不再檢查(否則會被右側的門一直判沒開、無謂多推)。
                 if self.door_verify:
                     opened = self._verify_door_open(push_start)
-                    n_repush = len(self.door_repush_times)
-                    for i, push_t in enumerate(self.door_repush_times, 1):
-                        if opened or stop_event.is_set():
-                            break
-                        print(f"[Task3] 判定門沒全開 → 補推 (第 {i}/{n_repush} 次, {push_t:.1f}s)")
-                        repush_start = self._current_xy()
-                        self._push_with_swing(push_t, stop_event, self.door_swing)
+                    if not opened and not stop_event.is_set():
+                        print(f"[Task3] 判定門沒全開 → 補推一次 "
+                              f"({self.door_repush_time:.1f}s，補推後不再檢查)")
+                        self._push_with_swing(self.door_repush_time, stop_event, self.door_swing)
                         arm.reset_arm()
-                        opened = self._verify_door_open(repush_start)
-                    if not opened:
-                        print(f"[Task3] 補推 {n_repush} 次後仍判定沒全開 → 放棄補推、繼續收尾")
                 # 全速後退脫離門口，再接導航回原點
                 if self.door_back_time > 0:
                     print(f"[Task3] 全速後退脫離門口 {self.door_back_time:.1f}s")
@@ -1106,25 +1105,6 @@ class AutoTaskController:
         self._timed_action("COUNTERCLOCKWISE_ROTATION", self.escape_turn_time, stop_event)
         self.car_controller.update_action("STOP")
         print("[Task3] 避障扭動結束 → 切回偵測熊模式")
-
-    def _get_start_pose(self, timeout=5.0):
-        """輪詢等待 /amcl_pose（AMCL 要先收到 initial pose + 一次更新才會發）。
-        最多等 timeout 秒，仍拿不到才放棄 RETURN。"""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            try:
-                pose, _ = self.data_processor.get_processed_amcl_pose()
-                if pose is not None:
-                    print(f"[Task1] 記錄起點: ({pose[0]:.2f}, {pose[1]:.2f})")
-                    return pose
-            except Exception:
-                pass
-            time.sleep(0.2)
-        print(
-            "⚠️ 等不到 /amcl_pose（已等 {:.0f}s），RETURN 將略過。".format(timeout)
-            + "請確認已在 Foxglove 設過 initial pose，且 `ros2 topic hz /amcl_pose` 有在跳。"
-        )
-        return None
 
     def _return_to_start(self, start_pose, stop_event):
         print(f"[Task1] RETURN → 回起點 ({start_pose[0]:.2f}, {start_pose[1]:.2f})")
