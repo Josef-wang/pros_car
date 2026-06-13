@@ -12,12 +12,14 @@ vel, rotate_vel為自走車PID數值, 可於arduino程式碼查看
 speed_ratio = 50
 vel = 6.0*speed_ratio
 vel_slow = 3.0*speed_ratio
+vel_creep = 1.5*speed_ratio   # 抓取前 depth creep 專用慢速(FORWARD_SLOW 的一半)；只給 Task1 _creep_to_depth
 rotate_vel = 6.0*speed_ratio
 rotate_vel_slow = 5.0*speed_ratio
 rotate_vel_median = 5.5*speed_ratio
 ACTION_MAPPINGS = {
     "FORWARD": [vel, vel, vel, vel],  # 前進
     "FORWARD_SLOW": [vel_slow, vel_slow, vel_slow, vel_slow],  # 前進
+    "FORWARD_CREEP": [vel_creep, vel_creep, vel_creep, vel_creep],  # 前進(抓取 creep 專用慢速)
     "LEFT_FRONT": [rotate_vel, rotate_vel * 1.2, rotate_vel, rotate_vel * 1.2],  # 左前
     "COUNTERCLOCKWISE_ROTATION": [
         -rotate_vel,

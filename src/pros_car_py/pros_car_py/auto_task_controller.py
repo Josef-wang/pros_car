@@ -468,7 +468,8 @@ class AutoTaskController:
                 #    不管剛剛停在 0.5 還 0.65，都先開到一致的近站距(或 depth 進盲區)。
                 if self.grasp_standoff > 0:
                     d = self._creep_to_depth(
-                        self.grasp_standoff, stop_event, timeout=self.grasp_creep_timeout
+                        self.grasp_standoff, stop_event, timeout=self.grasp_creep_timeout,
+                        forward_action="FORWARD_CREEP"   # Task1 抓取用專用慢速(75)，收斂更穩
                     )
                     if d is not None:
                         last_valid_depth = d  # 給投影用最新有效 depth
@@ -1163,7 +1164,8 @@ class AutoTaskController:
         )
 
     def _creep_to_depth(self, target_depth, stop_event, timeout=4.0,
-                        confirm_frames=1, blind_frames=3):
+                        confirm_frames=1, blind_frames=3,
+                        forward_action="FORWARD_SLOW"):
         """前進到 YOLO depth ≤ target_depth(或 depth 進盲區失效)才停。
 
         用 depth 回授把 FINE_ALIGN 那個受雜訊/網路延遲影響、會 run-to-run 飄的停車點，
@@ -1173,10 +1175,13 @@ class AutoTaskController:
 
         (B) confirm_frames/blind_frames：要求『連續』N 幀 ≤target 才停、『連續』M 幀無
         depth 才判進盲區 → 單幀雜訊不會提早停，停點 run-to-run 更一致。預設 1/3 = 原行為
-        (Task1 不受影響)；Task3 用較嚴的值收穩停點。"""
+        (Task1 不受影響)；Task3 用較嚴的值收穩停點。
+        forward_action：前進用的動作。預設 FORWARD_SLOW;Task1 抓取改傳 FORWARD_CREEP(更慢，
+        收斂更穩、不衝過站距/不撞熊)，Task3 維持 FORWARD_SLOW。"""
         dp = self.data_processor
         car = self.car_controller
-        print(f"[Task1] depth 閉環收斂站距 → ≤{target_depth:.2f}m (confirm={confirm_frames}, blind={blind_frames})")
+        print(f"[Task1] depth 閉環收斂站距 → ≤{target_depth:.2f}m (confirm={confirm_frames}, "
+              f"blind={blind_frames}, action={forward_action})")
         t0 = time.time()
         last_d = None
         misses = 0
@@ -1192,16 +1197,16 @@ class AutoTaskController:
                     hits += 1
                     if hits >= confirm_frames:
                         break                   # 連續確認到達目標站距
-                    car.update_action("FORWARD_SLOW")
+                    car.update_action(forward_action)
                 else:
                     hits = 0
-                    car.update_action("FORWARD_SLOW")
+                    car.update_action(forward_action)
             else:
                 hits = 0
                 misses += 1
                 if misses >= blind_frames:       # 連續無有效 depth = 已進盲區近點 → 停
                     break
-                car.update_action("FORWARD_SLOW")  # 單幀抖動：很近了，續推
+                car.update_action(forward_action)  # 單幀抖動：很近了，續推
             time.sleep(0.05)
         car.update_action("STOP")
         return last_d
