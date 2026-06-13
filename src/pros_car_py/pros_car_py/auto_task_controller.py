@@ -204,6 +204,7 @@ class AutoTaskController:
         self.task2_search_sweep_deg = 90.0    # 度：搖擺幅度 — 向左轉到 +此值、向右轉到 -此值 (用 AMCL yaw)
         self.task2_search_creep = 0.3         # 秒：到端點反向時微步向前的時間 (把橋帶進視野)
         self.task2_drive_time = 10.0          # 秒：對準後全速前進過橋的時間 (上+過+下一氣呵成，不判斷下橋)
+        self.task2_return_home = True         # 過橋後回起點 (重用 Task1/3 回程積木;需 AMCL+Nav2)
 
     # ==========================================
     # 對外介面 (給 mode 呼叫)
@@ -227,16 +228,31 @@ class AutoTaskController:
             self.start_x, self.start_y, self.start_yaw
         )
 
+    def _single_task_loops(self):
+        """單一 task 名稱 → 對應的狀態機 loop 函式 (start 與 _chain_loop 共用)。"""
+        return {
+            "task1": self._task1_loop,
+            "task2": self._task2_loop,
+            "task3": self._task3_loop,
+        }
+
+    # 串接按鈕：依序跑多個 task (每個 task 自己 reanchor 起點 + 結束回原點，故可串)
+    _task_chains = {
+        "task1→3→2": ["task1", "task3", "task2"],
+        "task3→2→1": ["task3", "task2", "task1"],
+    }
+
     def start(self, task_name):
         if self._running:
             print("⚠️ 已有 task 在執行中。")
             return
-        loop_fn = {
-            "task1": self._task1_loop,
-            "task2": self._task2_loop,
-            "task3": self._task3_loop,
-        }.get(task_name)
-        if loop_fn is None:
+        singles = self._single_task_loops()
+        if task_name in singles:
+            loop_fn = singles[task_name]
+        elif task_name in self._task_chains:
+            seq = self._task_chains[task_name]
+            loop_fn = lambda ev, seq=seq: self._chain_loop(seq, ev)
+        else:
             print(f"⚠️ {task_name} 尚未實作。")
             return
         self._stop_event = threading.Event()
@@ -256,6 +272,24 @@ class AutoTaskController:
         self.car_controller.update_action("STOP")
         self.ros_communicator.publish_yolo_target_class("")  # 取消 class 過濾
         print("⏹️ Auto task 已中止。")
+
+    def _chain_loop(self, task_names, stop_event):
+        """串接：在同一個執行緒裡依序跑多個 task 的狀態機 loop。每個 loop 是阻塞的，跑到
+        DONE/break 才回來;下一個 task 開頭會自己 reanchor 起點、上一個結尾會回原點，故可直接接。
+        按 'q'(stop) 設 stop_event → 當前 task loop 與此處都會收到、中止整串。"""
+        singles = self._single_task_loops()
+        chain_str = " → ".join(task_names)
+        print(f"[Chain] ▶️ 串接開始：{chain_str}")
+        for i, name in enumerate(task_names, 1):
+            if stop_event.is_set():
+                break
+            print(f"[Chain] === ({i}/{len(task_names)}) {name} 開始 ===")
+            singles[name](stop_event)
+            if stop_event.is_set():
+                print(f"[Chain] ⏹️ 於 {name} 中止 → 停止串接。")
+                return
+            print(f"[Chain] === {name} 完成 ===")
+        print(f"[Chain] ✅ 串接全部完成：{chain_str}")
 
     # ==========================================
     # Task 1 狀態機
@@ -1000,11 +1034,31 @@ class AutoTaskController:
                 print(f"[Task2] 全速前進過橋 {self.task2_drive_time:.1f}s")
                 self._timed_action("FORWARD", self.task2_drive_time, stop_event)
                 car.update_action("STOP")
+                state = "RETURN" if self.task2_return_home else "DONE"
+
+            elif state == "RETURN":
+                # 過橋後回起點 (重用 Task1/3 回程積木)。需 AMCL，拿不到就略過。
+                # 注意：過橋全程無定位、AMCL 可能已漂；且 Nav2 回程路徑可能再經橋(2D 圖看橋是地面)。
+                if self._current_xy() is None:
+                    print("[Task2] ⚠️ 拿不到 AMCL，略過回起點 (需 localization_unity)。")
+                else:
+                    print(f"[Task2] 過橋完成 → 回起點 ({self.start_x:.2f}, {self.start_y:.2f})")
+                    self._navigate_to(
+                        [self.start_x, self.start_y], stop_event, overshoot=0.0
+                    )
+                    self._creep_to_point(   # Nav2 0.5m 容差 → 閉環補完最後一段回到原點
+                        [self.start_x, self.start_y], stop_event,
+                        tol=self.release_creep_tol, timeout=self.release_creep_timeout,
+                    )
+                    car.update_action("STOP")
+                    self._orient_to_yaw(self.start_yaw, stop_event)   # 轉回 spawn 朝向 (走最短)
+                    car.update_action("STOP")
                 state = "DONE"
 
             elif state == "DONE":
                 car.update_action("STOP")
-                print("[Task2] ✅ 完成 (上下橋)。")
+                print("[Task2] ✅ 完成 (上下橋"
+                      + ("+回起點)。" if self.task2_return_home else ")。"))
                 break
 
             if state != prev_state:

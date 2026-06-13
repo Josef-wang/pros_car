@@ -88,7 +88,7 @@ class AutoArmMode(BaseMode):
 
 
 class AutoTaskMode(BaseMode):
-    submodes = ["task1", "task2", "task3"]
+    submodes = ["task1", "task2", "task3", "task1→3→2", "task3→2→1"]
 
     def enter(self):
         self.app.horizontal_select(self.submodes, self.handle_submode_select)
