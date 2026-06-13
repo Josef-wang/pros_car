@@ -169,14 +169,16 @@ class AutoTaskController:
         self.knob_final_creep_time = 1.0    # 秒：無 AMCL 時靠到最近的盲推秒數
         self.door_close_gripper = True      # True=閉合夾爪當壓桿；False=張開 (待實測)
         # 壓下不收手，直接全速 FORWARD(=手動 w)一路推開。全速約半速兩倍距離 → 時間要短。
-        self.door_push_time = 6.0           # 秒：壓住全速前推開門的時間 (沒全開→加長、撞過頭→縮短)
+        self.door_push_time = 8.0           # 秒：壓住全速前推開門的時間 (沒全開→加長、撞過頭→縮短)
         # 前推時手臂在 knob 高度上下來回「掃」，補 FINE_ALIGN 左右微誤差 → 提高壓到把手機率。
         self.door_swing = True              # True=前推時手臂上下擺動；False=固定壓住
         self.door_swing_amp = 0.06          # 公尺：從壓下 z 往上掃的幅度 (掃不到→加大、頂到門→減小)
         # (b) 推完驗證有沒有全開。實測：開門時車幾乎不前進 → 前向深度『看穿』為主判據
-        #     (開=前向~4m、關=一片~0.4m 近牆)，位移只當深度全失效時的 fallback。沒開→補推一次。
+        #     (開=前向~4m、關=一片~0.4m 近牆)，位移只當深度全失效時的 fallback。沒開→補推(迴圈)。
         self.door_verify = True             # True=推完判斷開門並在沒開時補推
-        self.door_repush_once = True        # True=判定沒全開時補推一次 (門已解鎖)
+        # 判定沒全開時補推:清單每個元素=該次補推秒數,長度=最多補推次數。推到驗證判定開為止。
+        # 門已解鎖、越補越開,故第二次只需短推;補推也讓手臂擺動(door_swing)補左右微誤差。
+        self.door_repush_times = [8.0, 5.0]  # 第1次補推 8s、第2次 5s (共最多 2 次)
         self.door_open_depth = 1.0          # 公尺：前向過半 sample ≥ 此值=看穿=已開 (主判據)
         self.door_clear_dist = 0.5          # 公尺：fallback——深度全失效時改看 AMCL 前推位移
         # 門推開後先全速後退脫離門口，再接導航回原點 (免卡在門上/與門框糾纏)。
@@ -825,15 +827,21 @@ class AutoTaskController:
                       + ("，手臂上下擺動" if self.door_swing else ""))
                 self._push_with_swing(self.door_push_time, stop_event, self.door_swing)
                 arm.reset_arm()                 # 開完才收手，免拖門/擋回程
-                # (b) 驗證有沒有全開：位移為主、深度為輔。沒開→補推一次(門已解鎖，不再擺動)
+                # (b) 驗證有沒有全開：深度看穿為主、位移為輔。沒開→依 door_repush_times 逐次補推
+                #     (推到判定全開為止;補推也讓手臂擺動 door_swing 補左右微誤差)。
                 if self.door_verify:
                     opened = self._verify_door_open(push_start)
-                    if not opened and self.door_repush_once:
-                        print("[Task3] 判定門沒全開 → 補推一次")
+                    n_repush = len(self.door_repush_times)
+                    for i, push_t in enumerate(self.door_repush_times, 1):
+                        if opened or stop_event.is_set():
+                            break
+                        print(f"[Task3] 判定門沒全開 → 補推 (第 {i}/{n_repush} 次, {push_t:.1f}s)")
                         repush_start = self._current_xy()
-                        self._push_with_swing(self.door_push_time, stop_event, False)
+                        self._push_with_swing(push_t, stop_event, self.door_swing)
                         arm.reset_arm()
-                        self._verify_door_open(repush_start)
+                        opened = self._verify_door_open(repush_start)
+                    if not opened:
+                        print(f"[Task3] 補推 {n_repush} 次後仍判定沒全開 → 放棄補推、繼續收尾")
                 # 全速後退脫離門口，再接導航回原點
                 if self.door_back_time > 0:
                     print(f"[Task3] 全速後退脫離門口 {self.door_back_time:.1f}s")
